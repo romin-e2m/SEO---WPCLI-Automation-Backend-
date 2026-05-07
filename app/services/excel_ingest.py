@@ -1,14 +1,147 @@
+import os
 import io
 import math
 from pathlib import PurePath
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pandas as pd
 import xlrd
 from openpyxl import load_workbook
+import ipaddress
+import socket
 
 _XLSX_MAGIC = b"PK"
 _XLS_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_DEFAULT_MAX_REMOTE_BYTES = 20 * 1024 * 1024
+
+
+def _max_remote_bytes() -> int:
+    raw = os.getenv("MAX_WORKBOOK_DOWNLOAD_BYTES", str(_DEFAULT_MAX_REMOTE_BYTES))
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return _DEFAULT_MAX_REMOTE_BYTES
+
+
+def _is_ip_private_or_local(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return bool(
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _validate_public_http_url(raw_url: str) -> None:
+    u = urlparse(raw_url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("Only http/https URLs are allowed.")
+    if not u.hostname:
+        raise ValueError("URL must include a hostname.")
+    host = u.hostname
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        raise ValueError("Could not resolve URL hostname.") from e
+    for info in infos:
+        ip = info[4][0]
+        if _is_ip_private_or_local(ip):
+            raise ValueError("URL resolves to a private or local network address (blocked).")
+
+
+def _maybe_google_sheets_export(url: str) -> str:
+    """
+    Best-effort transform of a Google Sheets share URL into an export URL.
+    Prefers xlsx to preserve multiple tabs.
+    """
+    u = urlparse(url)
+    if u.hostname not in ("docs.google.com", "drive.google.com"):
+        return url
+    if "/spreadsheets/d/" not in u.path:
+        return url
+
+    # Extract spreadsheet id from /spreadsheets/d/<id>/
+    parts = u.path.split("/spreadsheets/d/")
+    if len(parts) < 2:
+        return url
+    tail = parts[1]
+    sheet_id = tail.split("/", 1)[0].strip()
+    if not sheet_id:
+        return url
+
+    # Preserve gid if present (selects the sheet in export for some formats).
+    q = parse_qs(u.query or "")
+    gid = (q.get("gid") or [None])[0]
+    gid_q = f"&gid={gid}" if gid else ""
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx{gid_q}"
+
+
+def _infer_filename_from_url(url: str) -> str:
+    u = urlparse(url)
+    name = PurePath(u.path).name
+    if name and "." in name:
+        return name
+    return "workbook"
+
+
+def _infer_suffix_from_content(content: bytes) -> str:
+    if _is_probably_xlsx(content):
+        return ".xlsx"
+    if _is_probably_xls(content):
+        return ".xls"
+    return ".csv"
+
+
+async def download_spreadsheet_from_url(url: str) -> tuple[bytes, str]:
+    url = _maybe_google_sheets_export(url)
+    _validate_public_http_url(url)
+
+    limit = _max_remote_bytes()
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=True,
+        max_redirects=5,
+        headers={"User-Agent": "seo-wpcli-automation/1.0"},
+    ) as client:
+        try:
+            r = await client.get(url)
+        except Exception as e:
+            raise ValueError("Failed to download spreadsheet from URL.") from e
+
+        if r.status_code >= 400:
+            raise ValueError(f"URL download failed with HTTP {r.status_code}.")
+
+        # Stream into memory up to limit.
+        data = bytearray()
+        async for chunk in r.aiter_bytes():
+            if not chunk:
+                continue
+            data.extend(chunk)
+            if len(data) > limit:
+                raise ValueError(f"Remote file exceeds maximum size of {limit} bytes.")
+
+        content = bytes(data)
+
+        # Infer filename for downstream type selection.
+        base = _infer_filename_from_url(url)
+        suffix = PurePath(base).suffix.lower()
+        if suffix not in (".xlsx", ".xls", ".csv"):
+            suffix = _infer_suffix_from_content(content)
+            base = f"{PurePath(base).stem or 'workbook'}{suffix}"
+
+        return content, base
 
 
 def _is_probably_xlsx(content: bytes) -> bool:

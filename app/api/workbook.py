@@ -3,8 +3,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from app.schemas.workbook import SheetPreview, WorkbookAnalyzeResponse
-from app.services.excel_ingest import analyze_spreadsheet_bytes
+from app.schemas.workbook import SheetPreview, WorkbookAnalyzeResponse, WorkbookAnalyzeUrlRequest
+from app.services.excel_ingest import analyze_spreadsheet_bytes, download_spreadsheet_from_url
 
 router = APIRouter(prefix="/api/workbook", tags=["workbook"])
 
@@ -69,3 +69,19 @@ async def analyze_workbook(
         site_url=cleaned_site,
         sheets=sheets,
     )
+
+
+@router.post("/analyze-url", response_model=WorkbookAnalyzeResponse)
+async def analyze_workbook_url(payload: WorkbookAnalyzeUrlRequest) -> WorkbookAnalyzeResponse:
+    cleaned_site = (payload.site_url or "").strip() or None
+
+    try:
+        body, filename = await download_spreadsheet_from_url(str(payload.url))
+        sheets_raw, _ = analyze_spreadsheet_bytes(body, filename, preview_rows=payload.preview_rows)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Could not download or read spreadsheet from URL.") from e
+
+    sheets = [SheetPreview.model_validate(s) for s in sheets_raw]
+    return WorkbookAnalyzeResponse(filename=filename, site_url=cleaned_site, sheets=sheets)
