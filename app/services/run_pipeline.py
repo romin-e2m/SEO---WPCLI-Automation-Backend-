@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -15,6 +16,8 @@ from app.schemas.wp import SiteAccess
 from app.services.wp_adapters import detect_seo_meta_adapter
 from app.services.wp_rest import WpRestClient
 from app.services.wp_site import resolve_post_url, rest_client, wp_cli_runner
+
+logger = logging.getLogger(__name__)
 
 _ORDER = ("on_page", "meta", "images", "url_cleanup", "redirects_301")
 
@@ -46,10 +49,14 @@ def _iter_rows(grouped: dict[str, list[NormalizedRow]]):
 def _redirect_system(runner) -> str | None:
     if not runner:
         return None
-    names = {p.lower() for p in runner.active_plugins()}
-    if "redirection" in names:
-        return "redirection"
-    return None
+    try:
+        names = {p.lower() for p in runner.active_plugins()}
+        if "redirection" in names:
+            return "redirection"
+        return None
+    except Exception as e:
+        logger.error(f"Failed to detect redirect system: {type(e).__name__}: {str(e)}")
+        return None
 
 
 def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
@@ -145,8 +152,20 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
             resolution_method=res.method,
         )
     pid = res.post.id
-    adapter = detect_seo_meta_adapter(runner.active_plugins())
-    current = runner.get_post_meta(pid, adapter.metadesc_key) or ""
+    try:
+        adapter = detect_seo_meta_adapter(runner.active_plugins())
+        current = runner.get_post_meta(pid, adapter.metadesc_key) or ""
+    except Exception as e:
+        logger.error(f"WP-CLI error reading meta for post {pid}: {type(e).__name__}: {str(e)}")
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"WP-CLI error: {str(e)}",
+            post_id=pid,
+            resolution_method=res.method,
+        )
     if proposed == current:
         return DryRunRowResult(
             action_type="meta",
@@ -181,7 +200,18 @@ def _dry_images(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     v = row.values
     media_url = _s(v.get("image_url"))
     proposed = _s(v.get("recommended_alt_text"))
-    aid = runner.attachment_id_from_url(media_url)
+    try:
+        aid = runner.attachment_id_from_url(media_url)
+    except Exception as e:
+        logger.error(f"WP-CLI error resolving media URL: {type(e).__name__}: {str(e)}")
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"WP-CLI error: {str(e)}",
+            resolution_method="wp_cli:attachment_url_to_postid",
+        )
     if not aid:
         return DryRunRowResult(
             action_type="images",
@@ -191,7 +221,19 @@ def _dry_images(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
             message="Could not resolve image URL to a media attachment.",
             resolution_method="wp_cli:attachment_url_to_postid",
         )
-    current = runner.get_post_meta(aid, "_wp_attachment_image_alt") or ""
+    try:
+        current = runner.get_post_meta(aid, "_wp_attachment_image_alt") or ""
+    except Exception as e:
+        logger.error(f"WP-CLI error reading alt text for attachment {aid}: {type(e).__name__}: {str(e)}")
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"WP-CLI error: {str(e)}",
+            attachment_id=aid,
+            resolution_method="wp_cli:attachment_url_to_postid",
+        )
     if proposed == current:
         return DryRunRowResult(
             action_type="images",
@@ -319,20 +361,37 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Dr
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
 
     runner = wp_cli_runner(site)
-    adapter = detect_seo_meta_adapter(runner.active_plugins()) if runner else None
+    plugins: list[str] = []
+    if runner:
+        try:
+            plugins = runner.active_plugins()
+        except Exception as e:
+            logger.error(f"Failed to get active plugins: {type(e).__name__}: {str(e)}")
+            plugins = []
+    adapter = detect_seo_meta_adapter(plugins) if plugins else None
     rows_out: list[DryRunRowResult] = []
 
     for action, row in _iter_rows(grouped):
-        if action == "on_page":
-            rows_out.append(_dry_on_page(site, row))
-        elif action == "meta":
-            rows_out.append(_dry_meta(site, row))
-        elif action == "images":
-            rows_out.append(_dry_images(site, row))
-        elif action == "url_cleanup":
-            rows_out.append(_dry_url_cleanup(site, row))
-        elif action == "redirects_301":
-            rows_out.append(_dry_redirects(site, row))
+        try:
+            if action == "on_page":
+                rows_out.append(_dry_on_page(site, row))
+            elif action == "meta":
+                rows_out.append(_dry_meta(site, row))
+            elif action == "images":
+                rows_out.append(_dry_images(site, row))
+            elif action == "url_cleanup":
+                rows_out.append(_dry_url_cleanup(site, row))
+            elif action == "redirects_301":
+                rows_out.append(_dry_redirects(site, row))
+        except Exception as e:
+            logger.error(f"Dry-run error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
+            rows_out.append(DryRunRowResult(
+                action_type=action,
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="error",
+                message=f"Internal error: {str(e)}",
+            ))
 
     ready = sum(1 for r in rows_out if r.outcome == "change")
     blocked = sum(1 for r in rows_out if r.outcome == "blocked")
@@ -347,7 +406,7 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Dr
         no_change=no_change,
         detected_meta_plugin=adapter.plugin if adapter else None,
         meta_description_key=adapter.metadesc_key if adapter else None,
-        redirect_system=_redirect_system(runner),
+        redirect_system=_redirect_system(runner) if runner else None,
         rows=rows_out,
     )
 
@@ -464,11 +523,12 @@ def _exec_meta(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             outcome="failed",
             message="WP-CLI unavailable.",
         )
-    adapter = detect_seo_meta_adapter(runner.active_plugins())
-    proposed = _s(row.values.get("recommended_meta_description"))
     try:
+        adapter = detect_seo_meta_adapter(runner.active_plugins())
+        proposed = _s(row.values.get("recommended_meta_description"))
         runner.update_post_meta(dr.post_id, adapter.metadesc_key, proposed)
     except Exception as e:
+        logger.error(f"Failed to update meta for post {dr.post_id}: {type(e).__name__}: {str(e)}")
         return ExecuteRowResult(
             action_type="meta",
             sheet_name=row.sheet_name,
@@ -507,10 +567,11 @@ def _exec_images(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             outcome="failed",
             message="WP-CLI unavailable.",
         )
-    proposed = _s(row.values.get("recommended_alt_text"))
     try:
+        proposed = _s(row.values.get("recommended_alt_text"))
         runner.update_post_meta(dr.attachment_id, "_wp_attachment_image_alt", proposed)
     except Exception as e:
+        logger.error(f"Failed to update alt text for attachment {dr.attachment_id}: {type(e).__name__}: {str(e)}")
         return ExecuteRowResult(
             action_type="images",
             sheet_name=row.sheet_name,
@@ -637,16 +698,26 @@ def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Ex
 
     rows_out: list[ExecuteRowResult] = []
     for action, row in _iter_rows(grouped):
-        if action == "on_page":
-            rows_out.append(_exec_on_page(site, row))
-        elif action == "meta":
-            rows_out.append(_exec_meta(site, row))
-        elif action == "images":
-            rows_out.append(_exec_images(site, row))
-        elif action == "url_cleanup":
-            rows_out.append(_exec_url_cleanup(site, row))
-        elif action == "redirects_301":
-            rows_out.append(_exec_redirects(site, row))
+        try:
+            if action == "on_page":
+                rows_out.append(_exec_on_page(site, row))
+            elif action == "meta":
+                rows_out.append(_exec_meta(site, row))
+            elif action == "images":
+                rows_out.append(_exec_images(site, row))
+            elif action == "url_cleanup":
+                rows_out.append(_exec_url_cleanup(site, row))
+            elif action == "redirects_301":
+                rows_out.append(_exec_redirects(site, row))
+        except Exception as e:
+            logger.error(f"Execute error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
+            rows_out.append(ExecuteRowResult(
+                action_type=action,
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message=f"Internal error: {str(e)}",
+            ))
 
     updated = sum(1 for r in rows_out if r.outcome == "updated")
     skipped = sum(1 for r in rows_out if r.outcome == "skipped")

@@ -28,6 +28,8 @@ def wp_cli_runner(site: SiteAccess) -> WpCliRunner | None:
         if not cfg.ssh:
             return None
         ssh = cfg.ssh
+        if not ssh.host or not ssh.user:
+            return None
         return WpCliRunner(
             WpCliConfig(
                 mode="ssh",

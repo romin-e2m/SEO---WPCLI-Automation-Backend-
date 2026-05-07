@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from fastapi import APIRouter, HTTPException
 
 from app.schemas.wp import (
@@ -21,6 +22,7 @@ from app.schemas.wp import (
 from app.services.wp_adapters import detect_seo_meta_adapter
 from app.services.wp_site import resolve_post_url, rest_client, wp_cli_runner
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wp", tags=["wordpress"])
 
 
@@ -36,16 +38,21 @@ def site_precheck(body: SitePrecheckRequest) -> SitePrecheckResponse:
         rest_client(body.site).health_check()
         rest_ok = True
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"REST auth failed: {str(e)}") from e
+        logger.warning(f"REST precheck failed (non-blocking): {type(e).__name__}: {str(e)}")
 
-    runner = wp_cli_runner(body.site)
-    if runner:
-        try:
-            wp_cli_version = runner.version()
-            active_plugins = runner.active_plugins()
-            wp_cli_ok = True
-            wp_cli_mode = body.site.wp_cli.mode
-        except Exception:
+    if body.site.wp_cli:
+        wp_cli_mode = body.site.wp_cli.mode
+        runner = wp_cli_runner(body.site)
+        if runner:
+            try:
+                wp_cli_version = runner.version()
+                active_plugins = runner.active_plugins()
+                wp_cli_ok = True
+            except Exception as e:
+                logger.error(f"WP-CLI precheck failed: {type(e).__name__}: {str(e)}")
+                wp_cli_ok = False
+        else:
+            logger.warning("WP-CLI config provided but runner could not be initialized (incomplete SSH config?)")
             wp_cli_ok = False
 
     return SitePrecheckResponse(

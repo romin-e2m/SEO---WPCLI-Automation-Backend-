@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import html
 import re
+import os
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -15,6 +17,42 @@ def _normalize_base_url(base_url: str) -> str:
 
 def _wp_api_base(base_url: str) -> str:
     return f"{_normalize_base_url(base_url)}/wp-json/wp/v2"
+
+
+def _running_in_docker() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
+def _connection_help(base_url: str) -> str | None:
+    """
+    Actionable hints for common connectivity mistakes.
+    Must not include secrets.
+    """
+    try:
+        p = urlsplit(_normalize_base_url(base_url))
+    except Exception:
+        return None
+
+    if not p.scheme:
+        return "URL is missing scheme. Use http:// or https://"
+
+    host = (p.hostname or "").lower()
+    port = p.port
+    display_port = f":{port}" if port else ""
+
+    if _running_in_docker() and host in {"localhost", "127.0.0.1"}:
+        return (
+            "Backend is running in Docker, so localhost points to the container. "
+            f"Use http://host.docker.internal{display_port}/ (Mac/Windows) or expose the WP service on the Docker network."
+        )
+
+    if _running_in_docker() and host.endswith(".local"):
+        return (
+            f"Backend is running in Docker; mDNS hostnames like '{host}' often don't resolve/reach from containers. "
+            f"Prefer a routable IP/hostname, or use http://host.docker.internal{display_port}/, or add an explicit host mapping in compose."
+        )
+
+    return None
 
 
 def _strip_html(s: str | None) -> str | None:
@@ -52,9 +90,20 @@ class WpRestClient:
 
     def health_check(self) -> None:
         # A cheap authenticated call: current user.
-        with self._client() as c:
-            r = c.get("/users/me")
-            r.raise_for_status()
+        try:
+            with self._client() as c:
+                r = c.get("/users/me")
+                r.raise_for_status()
+        except httpx.ConnectError as e:
+            hint = _connection_help(self._auth.base_url)
+            msg = f"Unable to connect to {self._auth.base_url!r}."
+            if hint:
+                msg = f"{msg} {hint}"
+            raise RuntimeError(msg) from e
+        except httpx.UnsupportedProtocol as e:
+            raise RuntimeError(
+                f"Invalid site URL {self._auth.base_url!r}. Include http:// or https://"
+            ) from e
 
     def get_post(self, post_id: int) -> dict[str, Any]:
         with self._client() as c:

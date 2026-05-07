@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Sequence
+
+import paramiko
 
 
 @dataclass(frozen=True)
@@ -74,13 +79,17 @@ class WpCliRunner:
             if not self._cfg.ssh:
                 raise WpCliError("wp_cli.mode=ssh requires ssh config.")
             remote = shlex.join(full)
-            proc = subprocess.run(
-                _ssh_args(self._cfg.ssh) + [remote],
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
+            if shutil.which("ssh"):
+                proc = subprocess.run(
+                    _ssh_args(self._cfg.ssh) + [remote],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+            else:
+                stdout, stderr, rc = _run_paramiko(remote, self._cfg.ssh, timeout_seconds=timeout_seconds)
+                proc = subprocess.CompletedProcess(args=["paramiko-ssh", remote], returncode=rc, stdout=stdout, stderr=stderr)
         else:
             raise WpCliError(f"Unsupported wp_cli mode: {self._cfg.mode}")
 
@@ -156,4 +165,67 @@ class WpCliRunner:
             return None
         v = (out or "").strip()
         return v if v else None
+
+
+def _run_paramiko(command: str, ssh: WpCliSshConfig, *, timeout_seconds: int) -> tuple[str, str, int]:
+    """
+    Execute a command over SSH without relying on an `ssh` binary.
+    Supports key auth via:
+    - ssh.identity_file (path inside the container), or
+    - env WPCLI_SSH_PRIVATE_KEY (PEM text)
+    """
+    key_obj = None
+    key_text = os.getenv("WPCLI_SSH_PRIVATE_KEY")
+    if key_text:
+        try:
+            key_obj = paramiko.RSAKey.from_private_key(io.StringIO(key_text))
+        except Exception:
+            # Try Ed25519 as a common modern default
+            try:
+                key_obj = paramiko.Ed25519Key.from_private_key(io.StringIO(key_text))
+            except Exception as e:
+                raise WpCliError("Invalid WPCLI_SSH_PRIVATE_KEY format.") from e
+    elif ssh.identity_file:
+        try:
+            key_obj = paramiko.RSAKey.from_private_key_file(ssh.identity_file)
+        except Exception:
+            try:
+                key_obj = paramiko.Ed25519Key.from_private_key_file(ssh.identity_file)
+            except Exception as e:
+                raise WpCliError("Failed to read SSH identity_file inside backend container.") from e
+
+    if key_obj is None:
+        raise WpCliError(
+            "SSH key not provided. Set site.wp_cli.ssh.identity_file (mounted into the container) "
+            "or set WPCLI_SSH_PRIVATE_KEY in the backend environment."
+        )
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=ssh.host,
+            port=int(ssh.port),
+            username=ssh.user,
+            pkey=key_obj,
+            timeout=float(timeout_seconds),
+            banner_timeout=float(timeout_seconds),
+            auth_timeout=float(timeout_seconds),
+        )
+        chan = client.get_transport().open_session()  # type: ignore[union-attr]
+        chan.settimeout(float(timeout_seconds))
+        chan.exec_command(command)
+        stdout = chan.makefile("r", -1).read()
+        stderr = chan.makefile_stderr("r", -1).read()
+        rc = int(chan.recv_exit_status())
+        return stdout, stderr, rc
+    except WpCliError:
+        raise
+    except Exception as e:
+        raise WpCliError(str(e)) from e
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 

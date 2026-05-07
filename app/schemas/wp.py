@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class WpAuth(BaseModel):
@@ -14,14 +14,23 @@ class WpAuth(BaseModel):
 
 
 class WpCliSsh(BaseModel):
-    host: str
-    user: str
-    port: int = 22
+    host: str = Field(description="SSH hostname or IP address")
+    user: str = Field(description="SSH username")
+    port: int = Field(default=22, ge=1, le=65535, description="SSH port")
     identity_file: str | None = Field(
         default=None,
         description="Absolute path to SSH private key file (optional).",
     )
-    connect_timeout_seconds: int = 10
+    connect_timeout_seconds: int = Field(default=10, ge=1)
+
+    @field_validator("host", "user", mode="before")
+    @classmethod
+    def validate_required_strings(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v = v.strip()
+        if not v:
+            raise ValueError("host and user must not be empty")
+        return v
 
 
 class WpCliConfig(BaseModel):
