@@ -8,3 +8,14 @@ test/
 extra/
 .pytest_cache/
 .DS_Store
+
+# Graphify (local-only; never commit)
+graphify-out/
+.graphify-cache/
+.graphify/
+.graphify*.json
+.graphify*.db
+.graphifyignore
+CLAUDE.md
+.cursor/rules/graphify.mdc
+.claude/settings.json
