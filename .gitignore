@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+Dockerfile
+docker-compose.yml
+test/
+extra/
+.pytest_cache/
+.DS_Store
