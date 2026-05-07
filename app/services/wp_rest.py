@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -19,6 +20,13 @@ def _wp_api_base(base_url: str) -> str:
 def _strip_html(s: str | None) -> str | None:
     if s is None:
         return None
+    return re.sub(r"<[^>]*>", "", s).strip()
+
+
+def strip_html_tags(s: str | None) -> str:
+    """Plain text from HTML-ish strings (titles, rendered excerpts)."""
+    if s is None:
+        return ""
     return re.sub(r"<[^>]*>", "", s).strip()
 
 
@@ -133,4 +141,30 @@ class WpRestClient:
             "title": _strip_html(rendered_title),
             "content": rendered_content,
         }
+
+    @staticmethod
+    def first_h1_inner_text(html: str | None) -> str | None:
+        if not html:
+            return None
+        m = re.search(r"<h1\b[^>]*>(.*?)</h1>", html, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return None
+        return strip_html_tags(m.group(1)) or None
+
+    @staticmethod
+    def replace_first_h1_inner(html: str, new_inner_plain: str) -> tuple[str, bool]:
+        """Replace the inner HTML of the first <h1>. Plain text is HTML-escaped."""
+        inner = html.escape(new_inner_plain, quote=False)
+
+        def repl(m: re.Match[str]) -> str:
+            return f"{m.group(1)}{inner}{m.group(3)}"
+
+        new_html, n = re.subn(
+            r"(<h1\b[^>]*>)(.*?)(</h1>)",
+            repl,
+            html,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return new_html, n > 0
 

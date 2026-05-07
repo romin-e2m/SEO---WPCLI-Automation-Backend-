@@ -145,3 +145,15 @@ class WpCliRunner:
             timeout_seconds=20,
         )
 
+    def get_post_meta(self, post_id: int, meta_key: str) -> str | None:
+        """Return a single meta value, or None if missing / empty / error."""
+        try:
+            out = self.run(
+                ["post", "meta", "get", str(int(post_id)), meta_key, "--single"],
+                timeout_seconds=20,
+            )
+        except WpCliError:
+            return None
+        v = (out or "").strip()
+        return v if v else None
+

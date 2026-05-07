@@ -9,7 +9,6 @@ from app.schemas.wp import (
     ResolveMediaResponse,
     ResolvePostRequest,
     ResolvePostResponse,
-    ResolvedPost,
     SitePrecheckRequest,
     SitePrecheckResponse,
     UpdateAltTextRequest,
@@ -20,47 +19,9 @@ from app.schemas.wp import (
     UpdatePostResponse,
 )
 from app.services.wp_adapters import detect_seo_meta_adapter
-from app.services.wp_cli import WpCliConfig, WpCliRunner, WpCliSshConfig
-from app.services.wp_rest import WpRestAuth, WpRestClient
+from app.services.wp_site import resolve_post_url, rest_client, wp_cli_runner
 
 router = APIRouter(prefix="/api/wp", tags=["wordpress"])
-
-
-def _rest_client(req_site) -> WpRestClient:
-    rest = req_site.rest
-    return WpRestClient(
-        WpRestAuth(
-            base_url=rest.base_url,
-            username=rest.username,
-            application_password=rest.application_password,
-        )
-    )
-
-
-def _wp_cli_runner(req_site) -> WpCliRunner | None:
-    if not req_site.wp_cli:
-        return None
-    cfg = req_site.wp_cli
-    if cfg.mode == "local":
-        return WpCliRunner(WpCliConfig(mode="local", wp_path=cfg.wp_path, ssh=None))
-    if cfg.mode == "ssh":
-        if not cfg.ssh:
-            return None
-        ssh = cfg.ssh
-        return WpCliRunner(
-            WpCliConfig(
-                mode="ssh",
-                wp_path=cfg.wp_path,
-                ssh=WpCliSshConfig(
-                    host=ssh.host,
-                    user=ssh.user,
-                    port=ssh.port,
-                    identity_file=ssh.identity_file,
-                    connect_timeout_seconds=ssh.connect_timeout_seconds,
-                ),
-            )
-        )
-    return None
 
 
 @router.post("/site/precheck", response_model=SitePrecheckResponse)
@@ -72,12 +33,12 @@ def site_precheck(body: SitePrecheckRequest) -> SitePrecheckResponse:
     wp_cli_mode = None
 
     try:
-        _rest_client(body.site).health_check()
+        rest_client(body.site).health_check()
         rest_ok = True
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"REST auth failed: {str(e)}") from e
 
-    runner = _wp_cli_runner(body.site)
+    runner = wp_cli_runner(body.site)
     if runner:
         try:
             wp_cli_version = runner.version()
@@ -98,39 +59,14 @@ def site_precheck(body: SitePrecheckRequest) -> SitePrecheckResponse:
 
 @router.post("/posts/resolve", response_model=ResolvePostResponse)
 def resolve_post(body: ResolvePostRequest) -> ResolvePostResponse:
-    runner = _wp_cli_runner(body.site)
-    client = _rest_client(body.site)
-
-    if runner:
-        post_id = runner.url_to_postid(body.url)
-        if post_id:
-            obj = client.get_post(post_id)
-            return ResolvePostResponse(
-                found=True,
-                post=ResolvedPost(**WpRestClient.extract_summary_fields(obj)),
-                method="wp_cli:url_to_postid",
-            )
-
-    obj, method = client.resolve_post_by_url(body.url, post_type=body.post_type)
-    if not obj:
-        return ResolvePostResponse(found=False, post=None, method=method)
-    # For REST search results, we may not have edit context; fetch full post.
-    post_id = obj.get("id")
-    if not isinstance(post_id, int):
-        return ResolvePostResponse(found=False, post=None, method="rest_invalid_id")
-    full = client.get_post(post_id)
-    return ResolvePostResponse(
-        found=True,
-        post=ResolvedPost(**WpRestClient.extract_summary_fields(full)),
-        method=method,
-    )
+    return resolve_post_url(body.site, body.url, body.post_type)
 
 
 @router.post("/posts/update", response_model=UpdatePostResponse)
 def update_post(body: UpdatePostRequest) -> UpdatePostResponse:
     if body.title is None and body.content is None:
         raise HTTPException(status_code=400, detail="Provide title and/or content.")
-    client = _rest_client(body.site)
+    client = rest_client(body.site)
     try:
         updated = client.update_post(body.post_id, title=body.title, content=body.content)
     except Exception as e:
@@ -140,7 +76,7 @@ def update_post(body: UpdatePostRequest) -> UpdatePostResponse:
 
 @router.post("/media/resolve", response_model=ResolveMediaResponse)
 def resolve_media(body: ResolveMediaRequest) -> ResolveMediaResponse:
-    runner = _wp_cli_runner(body.site)
+    runner = wp_cli_runner(body.site)
     if not runner:
         raise HTTPException(
             status_code=400,
@@ -156,7 +92,7 @@ def resolve_media(body: ResolveMediaRequest) -> ResolveMediaResponse:
 
 @router.post("/media/update-alt", response_model=UpdateAltTextResponse)
 def update_alt_text(body: UpdateAltTextRequest) -> UpdateAltTextResponse:
-    runner = _wp_cli_runner(body.site)
+    runner = wp_cli_runner(body.site)
     if not runner:
         raise HTTPException(status_code=400, detail="Alt text update requires wp_cli config.")
     if not body.alt_text.strip():
@@ -170,7 +106,7 @@ def update_alt_text(body: UpdateAltTextRequest) -> UpdateAltTextResponse:
 
 @router.post("/meta/update-description", response_model=UpdateMetaDescriptionResponse)
 def update_meta_description(body: UpdateMetaDescriptionRequest) -> UpdateMetaDescriptionResponse:
-    runner = _wp_cli_runner(body.site)
+    runner = wp_cli_runner(body.site)
     if not runner:
         raise HTTPException(status_code=400, detail="Meta updates require wp_cli config.")
     plugins = runner.active_plugins()
@@ -195,7 +131,7 @@ def create_redirect(body: CreateRedirectRequest) -> CreateRedirectResponse:
     Adapter placeholder.
     For now, we implement a conservative baseline using the Redirection plugin command if present.
     """
-    runner = _wp_cli_runner(body.site)
+    runner = wp_cli_runner(body.site)
     if not runner:
         raise HTTPException(status_code=400, detail="Redirect creation requires wp_cli config.")
     if body.http_code != 301:
@@ -238,4 +174,3 @@ def create_redirect(body: CreateRedirectRequest) -> CreateRedirectResponse:
         status_code=400,
         detail="No supported redirect system detected. Install/enable Redirection plugin or add an adapter.",
     )
-

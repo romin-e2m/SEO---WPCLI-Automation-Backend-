@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.run import router as run_router
 from app.api.workbook import router as workbook_router
 from app.api.wp import router as wp_router
 
@@ -30,6 +31,7 @@ app.add_middleware(
 
 app.include_router(workbook_router)
 app.include_router(wp_router)
+app.include_router(run_router)
 
 
 @app.get("/health")
