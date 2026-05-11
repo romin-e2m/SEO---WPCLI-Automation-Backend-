@@ -34,20 +34,18 @@ class SchemaManager:
         builtin = [
             ActionSchema(
                 id="on_page",
-                label="On-Page (Title / H1 / Content)",
-                description="Manage page titles, H1 tags, and main content",
+                label="On-Page (Title / H1)",
+                description="Manage page titles and H1 tags",
                 fields=[
                     FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
                     FieldDefinition(key="current_title", label="Current title", type="text"),
                     FieldDefinition(key="recommended_title", label="Recommended title", type="text"),
                     FieldDefinition(key="current_h1", label="Current H1", type="text"),
                     FieldDefinition(key="recommended_h1", label="Recommended H1", type="text"),
-                    FieldDefinition(key="current_content", label="Current content", type="text"),
-                    FieldDefinition(key="recommended_content", label="Recommended content", type="text"),
                     FieldDefinition(key="notes", label="Notes", type="text"),
                 ],
                 any_of_groups=[
-                    AnyOfGroup(fields=["recommended_title", "recommended_h1", "recommended_content"])
+                    AnyOfGroup(fields=["recommended_title", "recommended_h1"])
                 ],
                 created_at=datetime.now(timezone.utc).isoformat(),
                 updated_at=datetime.now(timezone.utc).isoformat(),

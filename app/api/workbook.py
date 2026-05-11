@@ -272,7 +272,3 @@ async def normalize_mapping_dynamic_url(payload: MappingNormalizeUrlRequest, req
         site_url=cleaned_site,
     )
     return MappingNormalizeResponse(**resp)
-
-
-__all__ = ["router", "guess_action_type", "guess_column_map"]
-

@@ -1,9 +1,0 @@
-path: /wordpress
-skip-wordpress-checks: false
-
-# Database connection for Docker - hardcoded for Local by Flywheel
-dbhost: host.docker.internal
-dbport: 3306
-dbname: local
-dbuser: root
-dbpass: root

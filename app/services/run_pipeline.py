@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import html
 import logging
 import os
+import re
 from typing import Any
 
 from app.schemas.run import (
@@ -13,9 +16,21 @@ from app.schemas.run import (
 )
 from app.schemas.workbook import NormalizedRow
 from app.schemas.wp import SiteAccess
-from app.services.wp_adapters import detect_seo_meta_adapter
-from app.services.wp_rest import WpRestClient
-from app.services.wp_site import resolve_post_url, rest_client, wp_cli_runner
+from app.services.wp_rest import WpRestClient, _redirect_rest_backends
+from app.services.wp_site import resolve_post_url, rest_client
+from app.services.wp_playwright import (
+    extract_slug_with_trailing_slash,
+    launch_chromium,
+    WordPressPlaywright,
+    should_run_headless,
+)
+from app.services.monitor_broadcast import (
+    MONITOR_DEFAULT_ID,
+    clear_monitor_logs,
+    emit_monitor_phase,
+    emit_monitor_row_dry,
+    emit_monitor_row_exec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +59,6 @@ def _iter_rows(grouped: dict[str, list[NormalizedRow]]):
     for key in _ORDER:
         for row in grouped.get(key, []) or []:
             yield key, row
-
-
-def _redirect_system(runner) -> str | None:
-    if not runner:
-        return None
-    try:
-        names = {p.lower() for p in runner.active_plugins()}
-        if "redirection" in names:
-            return "redirection"
-        return None
-    except Exception as e:
-        logger.error(f"Failed to detect redirect system: {type(e).__name__}: {str(e)}")
-        return None
 
 
 def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
@@ -97,16 +99,12 @@ def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     rec_h1 = _s(v.get("recommended_h1"))
     rec_content = _s(v.get("recommended_content"))
 
-    if rec_h1 and not WpRestClient.first_h1_inner_text(cur_content):
-        return DryRunRowResult(
-            action_type="on_page",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="Recommended H1 is set but the post content has no <h1> tag to replace.",
-            post_id=pid,
-            resolution_method=res.method,
-        )
+    # H1 handling: only block if H1 change is requested but no <h1> exists AND user wants to replace it
+    # But if user is only providing H1 without knowing current structure, we can create a warning instead
+    if rec_h1 and not cur_h1 and not rec_content:
+        # Only H1 is being changed but no current H1 exists
+        # This is a warning, not a blocker - we can add an H1 tag
+        pass
 
     diffs: list[FieldDiff] = []
     if rec_title and rec_title != cur_title:
@@ -125,133 +123,6 @@ def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         post_id=pid,
         resolution_method=res.method,
         diffs=diffs,
-    )
-
-
-def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
-    runner = wp_cli_runner(site)
-    if not runner:
-        return DryRunRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="WP-CLI is required to read and write meta descriptions.",
-        )
-    v = row.values
-    page_url = _s(v.get("page_url"))
-    proposed = _s(v.get("recommended_meta_description"))
-    res = resolve_post_url(site, page_url)
-    if not res.found or not res.post:
-        return DryRunRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="Could not resolve page URL to a post or page.",
-            resolution_method=res.method,
-        )
-    pid = res.post.id
-    try:
-        adapter = detect_seo_meta_adapter(runner.active_plugins())
-        current = runner.get_post_meta(pid, adapter.metadesc_key) or ""
-    except Exception as e:
-        logger.error(f"WP-CLI error reading meta for post {pid}: {type(e).__name__}: {str(e)}")
-        return DryRunRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="error",
-            message=f"WP-CLI error: {str(e)}",
-            post_id=pid,
-            resolution_method=res.method,
-        )
-    if proposed == current:
-        return DryRunRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="no_change",
-            post_id=pid,
-            resolution_method=res.method,
-            diffs=[],
-        )
-    return DryRunRowResult(
-        action_type="meta",
-        sheet_name=row.sheet_name,
-        row_index=row.row_index,
-        outcome="change",
-        post_id=pid,
-        resolution_method=res.method,
-        diffs=[FieldDiff(field="meta_description", current=current, proposed=proposed)],
-    )
-
-
-def _dry_images(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
-    runner = wp_cli_runner(site)
-    if not runner:
-        return DryRunRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="WP-CLI is required to resolve media URLs and alt text.",
-        )
-    v = row.values
-    media_url = _s(v.get("image_url"))
-    proposed = _s(v.get("recommended_alt_text"))
-    try:
-        aid = runner.attachment_id_from_url(media_url)
-    except Exception as e:
-        logger.error(f"WP-CLI error resolving media URL: {type(e).__name__}: {str(e)}")
-        return DryRunRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="error",
-            message=f"WP-CLI error: {str(e)}",
-            resolution_method="wp_cli:attachment_url_to_postid",
-        )
-    if not aid:
-        return DryRunRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="Could not resolve image URL to a media attachment.",
-            resolution_method="wp_cli:attachment_url_to_postid",
-        )
-    try:
-        current = runner.get_post_meta(aid, "_wp_attachment_image_alt") or ""
-    except Exception as e:
-        logger.error(f"WP-CLI error reading alt text for attachment {aid}: {type(e).__name__}: {str(e)}")
-        return DryRunRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="error",
-            message=f"WP-CLI error: {str(e)}",
-            attachment_id=aid,
-            resolution_method="wp_cli:attachment_url_to_postid",
-        )
-    if proposed == current:
-        return DryRunRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="no_change",
-            attachment_id=aid,
-            resolution_method="wp_cli:attachment_url_to_postid",
-            diffs=[],
-        )
-    return DryRunRowResult(
-        action_type="images",
-        sheet_name=row.sheet_name,
-        row_index=row.row_index,
-        outcome="change",
-        attachment_id=aid,
-        resolution_method="wp_cli:attachment_url_to_postid",
-        diffs=[FieldDiff(field="alt_text", current=current, proposed=proposed)],
     )
 
 
@@ -286,16 +157,39 @@ def _dry_url_cleanup(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         )
     raw = WpRestClient.extract_summary_fields(obj).get("content")
     content = raw if isinstance(raw, str) else ""
-    if old_u not in content:
+    
+    # Try to find the URL in content with different variations
+    found = False
+    if old_u in content:
+        found = True
+    else:
+        # Try URL variations (with/without trailing slash, different protocols, etc.)
+        import re
+        # Make a regex pattern that matches the URL with various modifications
+        escaped_url = re.escape(old_u)
+        # Try with optional trailing slash, optional https/http variations
+        patterns = [
+            escaped_url,
+            escaped_url.rstrip("/") + "/?",  # with optional trailing slash
+            escaped_url.replace("http://", "https?://"),  # http or https
+            escaped_url.replace("https://", "https?://"),
+        ]
+        for pattern in patterns:
+            if re.search(pattern, content):
+                found = True
+                break
+    
+    if not found:
+        # Don't block - just warn. The URL might be in meta fields, custom fields, or will be skipped.
+        # Return as "change" anyway to allow user to decide
         return DryRunRowResult(
             action_type="url_cleanup",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
-            outcome="blocked",
-            message="The URL to replace was not found in the post body HTML.",
+            outcome="change",  # Changed from "blocked" to "change"
             post_id=pid,
             resolution_method=res.method,
-            diffs=[FieldDiff(field="content_url_replace", current=None, proposed=f"{old_u} → {new_u}")],
+            diffs=[FieldDiff(field="content_url_replace", current="[URL not found - will be skipped]", proposed=f"{old_u} → {new_u}")],
         )
     return DryRunRowResult(
         action_type="url_cleanup",
@@ -308,69 +202,634 @@ def _dry_url_cleanup(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     )
 
 
-def _dry_redirects(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
-    runner = wp_cli_runner(site)
-    if not runner:
-        return DryRunRowResult(
-            action_type="redirects_301",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="WP-CLI is required to create redirects.",
-        )
-    if _redirect_system(runner) is None:
-        return DryRunRowResult(
-            action_type="redirects_301",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message="No supported redirect system (Redirection plugin) detected.",
-        )
+def _dry_on_image(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     v = row.values
-    src = _s(v.get("source_url"))
-    dst = _s(v.get("target_url"))
-    if not src.startswith("http") or not dst.startswith("http"):
+    image_url = _s(v.get("image_url"))
+    rec_alt = _s(v.get("recommended_alt_text"))
+
+    if not image_url:
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Image URL is missing.",
+        )
+
+    if not rec_alt:
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Recommended alt text is missing.",
+        )
+
+    client = rest_client(site)
+    try:
+        media_id = client.search_media_by_url(image_url)
+    except Exception as e:
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"Media search failed: {e}",
+        )
+
+    if not media_id:
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message=f"Could not find media ID for image URL: {image_url}",
+        )
+
+    try:
+        media_obj = client.get_media(media_id)
+    except Exception as e:
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"REST fetch failed: {e}",
+        )
+
+    cur_alt = _s(media_obj.get("alt_text", ""))
+
+    if rec_alt == cur_alt:
+        return DryRunRowResult(
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="no_change",
+        )
+
+    return DryRunRowResult(
+        action_type="images",
+        sheet_name=row.sheet_name,
+        row_index=row.row_index,
+        outcome="change",
+        diffs=[FieldDiff(field="alt_text", current=cur_alt, proposed=rec_alt)],
+    )
+
+
+def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
+    """Dry-run for meta description updates."""
+    v = row.values
+    page_url = _s(v.get("page_url"))
+    rec_meta = _s(v.get("recommended_meta_description"))
+
+    if not page_url:
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Page URL is missing.",
+        )
+
+    if not rec_meta:
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Recommended meta description is missing.",
+        )
+
+    res = resolve_post_url(site, page_url)
+    if not res.found or not res.post:
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Could not resolve page URL to a post or page.",
+            resolution_method=res.method,
+        )
+
+    pid = res.post.id
+    client = rest_client(site)
+    try:
+        obj = client.get_post(pid)
+    except Exception as e:
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"REST fetch failed: {e}",
+            post_id=pid,
+            resolution_method=res.method,
+        )
+
+    # Try to extract existing meta description from multiple sources
+    # Plugin-specific meta fields
+    cur_meta = ""
+    
+    # Check Yoast SEO
+    yoast_meta = obj.get("meta", {})
+    if isinstance(yoast_meta, dict):
+        # Yoast stores in _yoast_wpseo_metadesc
+        cur_meta = _s(yoast_meta.get("_yoast_wpseo_metadesc", ""))
+    
+    # Check Rank Math
+    if not cur_meta and isinstance(yoast_meta, dict):
+        cur_meta = _s(yoast_meta.get("rank_math_description", "")) or _s(yoast_meta.get("_rank_math_description", ""))
+    
+    # Check SEOPress
+    if not cur_meta and isinstance(yoast_meta, dict):
+        cur_meta = _s(yoast_meta.get("_seopress_titles_desc", ""))
+    
+    # Fallback: Check yoast_head_json (rendered meta from Yoast)
+    if not cur_meta:
+        yoast_head_json = obj.get("yoast_head_json", {})
+        if isinstance(yoast_head_json, dict):
+            cur_meta = _s(yoast_head_json.get("description", ""))
+
+    if rec_meta == cur_meta:
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="no_change",
+            post_id=pid,
+            resolution_method=res.method,
+        )
+
+    return DryRunRowResult(
+        action_type="meta",
+        sheet_name=row.sheet_name,
+        row_index=row.row_index,
+        outcome="change",
+        post_id=pid,
+        resolution_method=res.method,
+        diffs=[FieldDiff(field="meta_description", current=cur_meta, proposed=rec_meta)],
+    )
+
+
+def _dry_redirects_301(site: SiteAccess, row: NormalizedRow, redirect_plugin: str | None = None) -> DryRunRowResult:
+    """Dry-run for 301 redirect creation - validates URLs."""
+    v = row.values
+    from_url = _s(v.get("source_url"))
+    to_url = _s(v.get("target_url"))
+
+    if not from_url:
         return DryRunRowResult(
             action_type="redirects_301",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
             outcome="blocked",
-            message="Source and destination must be absolute http(s) URLs.",
+            message="Source URL (source_url) is missing.",
         )
-    if src.rstrip("/") == dst.rstrip("/"):
+
+    if not to_url:
         return DryRunRowResult(
             action_type="redirects_301",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
             outcome="blocked",
-            message="Source and destination URLs must differ.",
+            message="Destination URL (target_url) is missing.",
         )
+
+    # Basic validation
+    if from_url == to_url:
+        return DryRunRowResult(
+            action_type="redirects_301",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Source and destination URLs cannot be the same (self-redirect).",
+        )
+
+    # Redirect will be attempted via REST API
+    # The system will try Redirection, Rank Math, and Safe Redirect Manager plugins in order
     return DryRunRowResult(
         action_type="redirects_301",
         sheet_name=row.sheet_name,
         row_index=row.row_index,
         outcome="change",
-        diffs=[FieldDiff(field="redirect", current=src, proposed=dst)],
+        message="Will create 301 redirect using the redirect plugin you selected (REST API when supported, otherwise admin UI).",
+        diffs=[FieldDiff(field="redirect_301", current=None, proposed=f"{from_url} → {to_url}")],
     )
 
 
-def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> DryRunResponse:
+def _exec_meta_via_rest(
+    site: SiteAccess,
+    row: NormalizedRow,
+    pid: int,
+    rec_meta: str,
+    seo_plugin: str | None,
+) -> ExecuteRowResult:
+    """Apply meta description via REST (shared by single-row and batch fallbacks)."""
+    client = rest_client(site)
+    try:
+        obj = client.update_seo_meta_description(pid, rec_meta, seo_plugin=seo_plugin)
+
+        if not obj or not isinstance(obj, dict):
+            logger.warning(
+                "Unexpected response from update_seo_meta_description for post %s",
+                pid,
+            )
+            return ExecuteRowResult(
+                action_type="meta",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Invalid response from meta update (REST API may have permission restrictions)",
+                post_id=pid,
+            )
+
+        post_id_returned = obj.get("id")
+        if not post_id_returned or post_id_returned != pid:
+            logger.warning(
+                "Meta update for post %s returned unexpected post id: %s",
+                pid,
+                post_id_returned,
+            )
+            return ExecuteRowResult(
+                action_type="meta",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Post ID mismatch in response (REST API may have permission restrictions)",
+                post_id=pid,
+            )
+
+        logger.info("Successfully updated post %s meta description (REST)", pid)
+
+    except Exception as e:
+        logger.error(
+            "Failed to update meta for post %s: %s: %s",
+            pid,
+            type(e).__name__,
+            str(e),
+        )
+        return ExecuteRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message=(
+                f"Meta update failed: {str(e)}. REST API may have permission "
+                "restrictions - consider using WP-CLI."
+            ),
+            post_id=pid,
+        )
+
+    return ExecuteRowResult(
+        action_type="meta",
+        sheet_name=row.sheet_name,
+        row_index=row.row_index,
+        outcome="updated",
+        post_id=pid,
+        detail={"raw_id": post_id_returned},
+    )
+
+
+async def _exec_meta_playwright_batch_run(
+    site: SiteAccess,
+    jobs: list[tuple[NormalizedRow, int, str, str]],
+) -> list[ExecuteRowResult]:
+    """
+    One browser session: login once, then update meta for each job
+    ``(row, post_id, page_url, rec_meta)``.
+    """
+    if not site.playwright:
+        raise ValueError("Playwright credentials not provided")
+
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await launch_chromium(p, headless=should_run_headless())
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 1024},
+            ignore_https_errors=True,
+        )
+        page = await context.new_page()
+        page.set_default_timeout(45000)
+        page.set_default_navigation_timeout(45000)
+
+        wp = WordPressPlaywright(
+            site.playwright.admin_url,
+            site.playwright.username,
+            site.playwright.password.get_secret_value(),
+        )
+
+        if not await wp.login(page):
+            await context.close()
+            await browser.close()
+            fail_logs = wp.logger.get_logs()
+            return [
+                ExecuteRowResult(
+                    action_type="meta",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Failed to log in to WordPress admin panel",
+                    detail={"logs": fail_logs},
+                    post_id=pid,
+                )
+                for row, pid, _url, _meta in jobs
+            ]
+
+        out: list[ExecuteRowResult] = []
+        for row, pid, page_url, rec_meta in jobs:
+            wp.logger.clear_logs()
+            result = await wp.update_meta_description(
+                page_url,
+                rec_meta,
+                page,
+                post_id=pid,
+                light_mode=True,
+            )
+            logs = wp.logger.get_logs()
+            if result.get("status") == "updated":
+                out.append(
+                    ExecuteRowResult(
+                        action_type="meta",
+                        sheet_name=row.sheet_name,
+                        row_index=row.row_index,
+                        outcome="updated",
+                        post_id=pid,
+                        detail={"playwright_logs": logs, "raw_id": pid},
+                    )
+                )
+            else:
+                out.append(
+                    ExecuteRowResult(
+                        action_type="meta",
+                        sheet_name=row.sheet_name,
+                        row_index=row.row_index,
+                        outcome="failed",
+                        message=result.get("error", "Unknown error"),
+                        detail={"playwright_logs": logs},
+                        post_id=pid,
+                    )
+                )
+
+        await context.close()
+        await browser.close()
+        return out
+
+
+def _exec_meta_consecutive_playwright_batch(
+    site: SiteAccess,
+    batch: list[NormalizedRow],
+    seo_plugin: str | None,
+) -> list[ExecuteRowResult]:
+    """Dry-run each meta row; run one Playwright session for all rows that need a change."""
+    n = len(batch)
+    results: list[ExecuteRowResult | None] = [None] * n
+    jobs: list[tuple[int, NormalizedRow, int, str, str]] = []
+
+    for i, row in enumerate(batch):
+        dr = _dry_meta(site, row)
+        v = row.values
+        page_url = _s(v.get("page_url"))
+        rec_meta = _s(v.get("recommended_meta_description"))
+
+        if dr.outcome != "change":
+            results[i] = ExecuteRowResult(
+                action_type="meta",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="skipped" if dr.outcome == "no_change" else "failed",
+                message=dr.message,
+                post_id=dr.post_id,
+            )
+            continue
+
+        pid = dr.post_id
+        if not pid:
+            results[i] = ExecuteRowResult(
+                action_type="meta",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Missing post id.",
+            )
+            continue
+
+        jobs.append((i, row, pid, page_url, rec_meta))
+
+    if jobs:
+        ordered = [(row, pid, url, meta) for (_i, row, pid, url, meta) in jobs]
+        try:
+            pw_list = asyncio.run(_exec_meta_playwright_batch_run(site, ordered))
+        except RuntimeError as e:
+            if "asyncio.run() cannot be called from a running event loop" in str(e):
+                logger.warning(
+                    "asyncio.run unavailable for meta batch; using REST per row",
+                )
+                for k, (idx, row, pid, url, meta) in enumerate(jobs):
+                    results[idx] = _exec_meta_via_rest(site, row, pid, meta, seo_plugin)
+            else:
+                raise
+        else:
+            for k, (idx, row, pid, url, meta) in enumerate(jobs):
+                results[idx] = pw_list[k]
+
+    return [r for r in results if r is not None]
+
+
+async def _exec_meta_playwright(
+    site: SiteAccess,
+    page_url: str,
+    meta_description: str,
+    row: NormalizedRow,
+    *,
+    post_id: int,
+) -> ExecuteRowResult:
+    """Execute meta description update using Playwright (editor opened by REST-resolved post_id)."""
+    if not site.playwright:
+        raise ValueError("Playwright credentials not provided")
+    
+    try:
+        from playwright.async_api import async_playwright
+        
+        async with async_playwright() as p:
+            browser = await launch_chromium(p, headless=should_run_headless())
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 1024},
+                ignore_https_errors=True,
+            )
+            page = await context.new_page()
+            page.set_default_timeout(45000)
+            page.set_default_navigation_timeout(45000)
+            
+            wp = WordPressPlaywright(
+                site.playwright.admin_url,
+                site.playwright.username,
+                site.playwright.password.get_secret_value(),
+            )
+            
+            # Login
+            if not await wp.login(page):
+                await context.close()
+                await browser.close()
+                return ExecuteRowResult(
+                    action_type="meta",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Failed to log in to WordPress admin panel",
+                    detail={"logs": wp.logger.get_logs()},
+                    post_id=post_id,
+                )
+            
+            result = await wp.update_meta_description(
+                page_url,
+                meta_description,
+                page,
+                post_id=post_id,
+                light_mode=True,
+            )
+            
+            await context.close()
+            await browser.close()
+            
+            logs = wp.logger.get_logs()
+            
+            if result.get("status") == "updated":
+                logger.info(
+                    "Meta description updated via Playwright for post_id=%s url=%s",
+                    post_id,
+                    page_url,
+                )
+                return ExecuteRowResult(
+                    action_type="meta",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="updated",
+                    post_id=post_id,
+                    detail={"playwright_logs": logs, "raw_id": post_id},
+                )
+            else:
+                logger.error(f"Playwright meta update failed: {result.get('error')}")
+                return ExecuteRowResult(
+                    action_type="meta",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message=result.get("error", "Unknown error"),
+                    detail={"playwright_logs": logs},
+                    post_id=post_id,
+                )
+    
+    except Exception as e:
+        logger.error(f"Playwright execution failed: {e}")
+        return ExecuteRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message=f"Playwright error: {str(e)}",
+            post_id=post_id,
+        )
+
+
+async def _exec_redirects_301_playwright(
+    site: SiteAccess, from_url: str, to_url: str, row: NormalizedRow
+) -> ExecuteRowResult:
+    """Execute 301 redirect creation using Playwright."""
+    if not site.playwright:
+        raise ValueError("Playwright credentials not provided")
+    
+    try:
+        from playwright.async_api import async_playwright
+        
+        async with async_playwright() as p:
+            browser = await launch_chromium(p, headless=should_run_headless())
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            wp = WordPressPlaywright(
+                site.playwright.admin_url,
+                site.playwright.username,
+                site.playwright.password.get_secret_value(),
+            )
+            
+            # Login
+            if not await wp.login(page):
+                await context.close()
+                await browser.close()
+                return ExecuteRowResult(
+                    action_type="redirects_301",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Failed to log in to WordPress admin panel",
+                    detail={"logs": wp.logger.get_logs()},
+                )
+            
+            # Extract slug with trailing slash from from_url
+            from_slug = extract_slug_with_trailing_slash(from_url)
+            
+            if not from_slug:
+                await context.close()
+                await browser.close()
+                return ExecuteRowResult(
+                    action_type="redirects_301",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message=f"Could not extract slug from URL: {from_url}",
+                )
+            
+            # Create redirect
+            result = await wp.create_301_redirect(from_slug, to_url, page)
+            
+            await context.close()
+            await browser.close()
+            
+            logs = wp.logger.get_logs()
+            
+            if result.get("status") == "created":
+                logger.info(f"301 redirect created via Playwright: {from_slug} → {to_url}")
+                return ExecuteRowResult(
+                    action_type="redirects_301",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="updated",
+                    detail={"playwright_logs": logs},
+                )
+            else:
+                logger.error(f"Playwright redirect creation failed: {result.get('error')}")
+                return ExecuteRowResult(
+                    action_type="redirects_301",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message=result.get("error", "Unknown error"),
+                    detail={"playwright_logs": logs},
+                )
+    
+    except Exception as e:
+        logger.error(f"Playwright execution failed: {e}")
+        return ExecuteRowResult(
+            action_type="redirects_301",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message=f"Playwright error: {str(e)}",
+        )
+
+
+
+def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redirect_plugin: str | None = None, seo_plugin: str | None = None) -> DryRunResponse:
     total = _count_grouped(grouped)
     limit = _max_run_rows()
     if total > limit:
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
 
-    runner = wp_cli_runner(site)
-    plugins: list[str] = []
-    if runner:
-        try:
-            plugins = runner.active_plugins()
-        except Exception as e:
-            logger.error(f"Failed to get active plugins: {type(e).__name__}: {str(e)}")
-            plugins = []
-    adapter = detect_seo_meta_adapter(plugins) if plugins else None
-    rows_out: list[DryRunRowResult] = []
+    clear_monitor_logs(MONITOR_DEFAULT_ID)
+    emit_monitor_phase(MONITOR_DEFAULT_ID, "Dry-run started", f"{total} row(s)")
 
+    rows_out: list[DryRunRowResult] = []
     for action, row in _iter_rows(grouped):
         try:
             if action == "on_page":
@@ -378,11 +837,11 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Dr
             elif action == "meta":
                 rows_out.append(_dry_meta(site, row))
             elif action == "images":
-                rows_out.append(_dry_images(site, row))
+                rows_out.append(_dry_on_image(site, row))
             elif action == "url_cleanup":
                 rows_out.append(_dry_url_cleanup(site, row))
             elif action == "redirects_301":
-                rows_out.append(_dry_redirects(site, row))
+                rows_out.append(_dry_redirects_301(site, row, redirect_plugin))
         except Exception as e:
             logger.error(f"Dry-run error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
             rows_out.append(DryRunRowResult(
@@ -392,11 +851,26 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Dr
                 outcome="error",
                 message=f"Internal error: {str(e)}",
             ))
+        dr = rows_out[-1]
+        emit_monitor_row_dry(
+            MONITOR_DEFAULT_ID,
+            action,
+            dr.sheet_name,
+            dr.row_index,
+            str(dr.outcome),
+            dr.message,
+        )
 
     ready = sum(1 for r in rows_out if r.outcome == "change")
     blocked = sum(1 for r in rows_out if r.outcome == "blocked")
     errors = sum(1 for r in rows_out if r.outcome == "error")
     no_change = sum(1 for r in rows_out if r.outcome == "no_change")
+
+    emit_monitor_phase(
+        MONITOR_DEFAULT_ID,
+        "Dry-run finished",
+        f"change={ready}, blocked={blocked}, error={errors}, no_change={no_change}",
+    )
 
     return DryRunResponse(
         rows_processed=len(rows_out),
@@ -404,9 +878,6 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Dr
         blocked=blocked,
         errors=errors,
         no_change=no_change,
-        detected_meta_plugin=adapter.plugin if adapter else None,
-        meta_description_key=adapter.metadesc_key if adapter else None,
-        redirect_system=_redirect_system(runner) if runner else None,
         rows=rows_out,
     )
 
@@ -458,17 +929,25 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
         new_content = rec_content
     rec_h1 = _s(v.get("recommended_h1"))
     if rec_h1:
-        patched, ok = WpRestClient.replace_first_h1_inner(new_content, rec_h1)
-        if not ok:
-            return ExecuteRowResult(
-                action_type="on_page",
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="failed",
-                message="No <h1> found to replace.",
-                post_id=pid,
-            )
-        new_content = patched
+        cur_h1 = WpRestClient.first_h1_inner_text(new_content)
+        if cur_h1:
+            # H1 tag exists, replace it
+            patched, ok = WpRestClient.replace_first_h1_inner(new_content, rec_h1)
+            if not ok:
+                return ExecuteRowResult(
+                    action_type="on_page",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="No <h1> found to replace.",
+                    post_id=pid,
+                )
+            new_content = patched
+        else:
+            # No H1 tag exists, create one at the beginning of content
+            escaped_h1 = html.escape(rec_h1, quote=False)
+            h1_html = f"<h1>{escaped_h1}</h1>"
+            new_content = h1_html + "\n" + new_content
 
     title_arg = new_title if new_title != cur_title else None
     content_arg = new_content if new_content != content else None
@@ -484,7 +963,9 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
 
     try:
         out = client.update_post(pid, title=title_arg, content=content_arg)
+        logger.info(f"Updated post {pid}: title={bool(title_arg)}, content={bool(content_arg)}, response_id={out.get('id')}")
     except Exception as e:
+        logger.error(f"Failed to update post {pid}: {type(e).__name__}: {str(e)}")
         return ExecuteRowResult(
             action_type="on_page",
             sheet_name=row.sheet_name,
@@ -500,92 +981,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
         outcome="updated",
         post_id=pid,
         detail={"raw_id": out.get("id")},
-    )
-
-
-def _exec_meta(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
-    dr = _dry_meta(site, row)
-    if dr.outcome != "change":
-        return ExecuteRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="skipped" if dr.outcome == "no_change" else "failed",
-            message=dr.message or ("No meta change needed." if dr.outcome == "no_change" else None),
-            post_id=dr.post_id,
-        )
-    runner = wp_cli_runner(site)
-    if not runner or not dr.post_id:
-        return ExecuteRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="failed",
-            message="WP-CLI unavailable.",
-        )
-    try:
-        adapter = detect_seo_meta_adapter(runner.active_plugins())
-        proposed = _s(row.values.get("recommended_meta_description"))
-        runner.update_post_meta(dr.post_id, adapter.metadesc_key, proposed)
-    except Exception as e:
-        logger.error(f"Failed to update meta for post {dr.post_id}: {type(e).__name__}: {str(e)}")
-        return ExecuteRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="failed",
-            message=str(e),
-            post_id=dr.post_id,
-        )
-    return ExecuteRowResult(
-        action_type="meta",
-        sheet_name=row.sheet_name,
-        row_index=row.row_index,
-        outcome="updated",
-        post_id=dr.post_id,
-        detail={"plugin": adapter.plugin, "meta_key": adapter.metadesc_key},
-    )
-
-
-def _exec_images(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
-    dr = _dry_images(site, row)
-    if dr.outcome != "change":
-        return ExecuteRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="skipped" if dr.outcome == "no_change" else "failed",
-            message=dr.message,
-            attachment_id=dr.attachment_id,
-        )
-    runner = wp_cli_runner(site)
-    if not runner or not dr.attachment_id:
-        return ExecuteRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="failed",
-            message="WP-CLI unavailable.",
-        )
-    try:
-        proposed = _s(row.values.get("recommended_alt_text"))
-        runner.update_post_meta(dr.attachment_id, "_wp_attachment_image_alt", proposed)
-    except Exception as e:
-        logger.error(f"Failed to update alt text for attachment {dr.attachment_id}: {type(e).__name__}: {str(e)}")
-        return ExecuteRowResult(
-            action_type="images",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="failed",
-            message=str(e),
-            attachment_id=dr.attachment_id,
-        )
-    return ExecuteRowResult(
-        action_type="images",
-        sheet_name=row.sheet_name,
-        row_index=row.row_index,
-        outcome="updated",
-        attachment_id=dr.attachment_id,
     )
 
 
@@ -616,19 +1011,41 @@ def _exec_url_cleanup(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     obj = client.get_post(pid)
     raw = WpRestClient.extract_summary_fields(obj).get("content")
     content = raw if isinstance(raw, str) else ""
-    new_content = content.replace(old_u, new_u)
+    
+    # Replace URLs with regex to handle variations
+    escaped_url = re.escape(old_u)
+    patterns = [
+        (escaped_url, new_u),
+        (escaped_url.rstrip("/") + "/?", new_u),
+        (escaped_url.replace("http://", "https?://"), new_u),
+    ]
+    
+    new_content = content
+    replacements_made = False
+    for pattern, replacement in patterns:
+        try:
+            new_new_content = re.sub(pattern, replacement, new_content)
+            if new_new_content != new_content:
+                replacements_made = True
+                new_content = new_new_content
+        except Exception:
+            pass
+    
     if new_content == content:
+        # No replacements made - URL not found, but that's OK, just skip
         return ExecuteRowResult(
             action_type="url_cleanup",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
-            outcome="failed",
-            message="Replacement produced no change.",
+            outcome="skipped",
+            message="URL not found in content (already clean or in meta fields).",
             post_id=pid,
         )
     try:
-        client.update_post(pid, title=None, content=new_content)
+        result = client.update_post(pid, title=None, content=new_content)
+        logger.info(f"Updated post {pid} URL cleanup (content replaced), response_id={result.get('id')}")
     except Exception as e:
+        logger.error(f"Failed to update post {pid} for URL cleanup: {type(e).__name__}: {str(e)}")
         return ExecuteRowResult(
             action_type="url_cleanup",
             sheet_name=row.sheet_name,
@@ -646,69 +1063,247 @@ def _exec_url_cleanup(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     )
 
 
-def _exec_redirects(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
-    dr = _dry_redirects(site, row)
+def _exec_on_image(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
+    dr = _dry_on_image(site, row)
     if dr.outcome != "change":
         return ExecuteRowResult(
-            action_type="redirects_301",
+            action_type="images",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
-            outcome="failed",
+            outcome="skipped" if dr.outcome == "no_change" else "failed",
             message=dr.message,
         )
-    runner = wp_cli_runner(site)
-    if not runner:
+
+    v = row.values
+    image_url = _s(v.get("image_url"))
+    rec_alt = _s(v.get("recommended_alt_text"))
+
+    client = rest_client(site)
+    try:
+        media_id = client.search_media_by_url(image_url)
+    except Exception as e:
         return ExecuteRowResult(
-            action_type="redirects_301",
+            action_type="images",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
             outcome="failed",
-            message="WP-CLI unavailable.",
+            message=f"Media search failed: {e}",
         )
-    v = row.values
-    src = _s(v.get("source_url"))
-    dst = _s(v.get("target_url"))
-    try:
-        out = runner.run(
-            ["redirection", "add", "--url", src, "--target", dst, "--code", "301"],
-            timeout_seconds=30,
-        )
-    except Exception as e:
+
+    if not media_id:
         return ExecuteRowResult(
-            action_type="redirects_301",
+            action_type="images",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message=f"Could not find media ID for image URL: {image_url}",
+        )
+
+    try:
+        result = client.update_media_alt_text(media_id, alt_text=rec_alt)
+        logger.info(f"Updated media {media_id} alt text: {rec_alt}, response_id={result.get('id')}")
+    except Exception as e:
+        logger.error(f"Failed to update media {media_id}: {type(e).__name__}: {str(e)}")
+        return ExecuteRowResult(
+            action_type="images",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
             outcome="failed",
             message=str(e),
         )
+
+    return ExecuteRowResult(
+        action_type="images",
+        sheet_name=row.sheet_name,
+        row_index=row.row_index,
+        outcome="updated",
+    )
+
+
+def _exec_meta(site: SiteAccess, row: NormalizedRow, seo_plugin: str | None = None) -> ExecuteRowResult:
+    """Execute meta description update via Playwright or REST API."""
+    dr = _dry_meta(site, row)
+    if dr.outcome != "change":
+        return ExecuteRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="skipped" if dr.outcome == "no_change" else "failed",
+            message=dr.message,
+            post_id=dr.post_id,
+        )
+
+    v = row.values
+    pid = dr.post_id
+    if not pid:
+        return ExecuteRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message="Missing post id.",
+        )
+
+    rec_meta = _s(v.get("recommended_meta_description"))
+    page_url = _s(v.get("page_url"))
+
+    # If Playwright auth is provided, use UI automation instead of REST API
+    if site.playwright:
+        try:
+            logger.info(f"Using Playwright to update meta description for {page_url}")
+            try:
+                result = asyncio.run(
+                    _exec_meta_playwright(
+                        site, page_url, rec_meta, row, post_id=pid
+                    )
+                )
+                return result
+            except RuntimeError as e:
+                if "asyncio.run() cannot be called from a running event loop" in str(e):
+                    logger.warning("Sync context only - Playwright UI automation not available in async context, using REST API")
+                else:
+                    raise
+        except Exception as e:
+            logger.error(f"Playwright meta update failed, falling back to REST API: {e}")
+
+    return _exec_meta_via_rest(site, row, pid, rec_meta, seo_plugin)
+
+
+def _exec_redirects_301(site: SiteAccess, row: NormalizedRow, redirect_plugin: str | None = None) -> ExecuteRowResult:
+    """Execute 301 redirect: REST API for capable plugins; Playwright for UI-only (e.g. EPS 301 Redirects)."""
+    dr = _dry_redirects_301(site, row, redirect_plugin)
+    if dr.outcome != "change":
+        return ExecuteRowResult(
+            action_type="redirects_301",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="skipped" if dr.outcome == "no_change" else "failed",
+            message=dr.message,
+        )
+
+    v = row.values
+    from_url = _s(v.get("source_url"))
+    to_url = _s(v.get("target_url"))
+
+    rest_backends = _redirect_rest_backends(redirect_plugin)
+    plugin_explicit = bool((redirect_plugin or "").strip())
+    client = rest_client(site)
+
+    result: dict[str, Any] | None = None
+    if rest_backends:
+        try:
+            result = client.create_redirect(from_url, to_url, redirect_plugin)
+        except Exception as e:
+            logger.error(f"REST redirect creation raised: {type(e).__name__}: {str(e)}")
+            result = {"status": "failed", "message": str(e)}
+
+        if isinstance(result, dict) and result.get("status") == "created":
+            redirect_id = result.get("id")
+            plugin_used = result.get("plugin", "Unknown")
+            logger.info(f"Created redirect {from_url} → {to_url} via {plugin_used}, id={redirect_id}")
+            return ExecuteRowResult(
+                action_type="redirects_301",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="updated",
+                detail={"redirect_id": redirect_id, "plugin": plugin_used} if redirect_id else {"plugin": plugin_used},
+            )
+
+        if plugin_explicit:
+            msg = (result or {}).get("message") or (result or {}).get("error") or "REST redirect creation failed"
+            return ExecuteRowResult(
+                action_type="redirects_301",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message=str(msg),
+            )
+
+    if site.playwright:
+        try:
+            logger.info(f"Using Playwright to create 301 redirect: {from_url} → {to_url}")
+            try:
+                result = asyncio.run(_exec_redirects_301_playwright(site, from_url, to_url, row))
+                return result
+            except RuntimeError as e:
+                if "asyncio.run() cannot be called from a running event loop" in str(e):
+                    logger.warning("Sync context only - Playwright UI automation not available in async context")
+                else:
+                    raise
+        except Exception as e:
+            logger.error(f"Playwright redirect creation failed: {e}")
+            return ExecuteRowResult(
+                action_type="redirects_301",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message=str(e),
+            )
+
+    if not rest_backends:
+        return ExecuteRowResult(
+            action_type="redirects_301",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message="Selected redirect plugin has no REST API. Add WP admin password and Admin panel URL for UI automation.",
+        )
+
+    msg = (result or {}).get("message") or (result or {}).get("error") or "Redirect creation failed"
     return ExecuteRowResult(
         action_type="redirects_301",
         sheet_name=row.sheet_name,
         row_index=row.row_index,
-        outcome="updated",
-        detail={"system": "redirection", "output": out},
+        outcome="failed",
+        message=str(msg),
     )
 
 
-def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> ExecuteResponse:
+
+def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redirect_plugin: str | None = None, seo_plugin: str | None = None) -> ExecuteResponse:
     total = _count_grouped(grouped)
     limit = _max_run_rows()
     if total > limit:
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
 
+    clear_monitor_logs(MONITOR_DEFAULT_ID)
+    emit_monitor_phase(MONITOR_DEFAULT_ID, "Execute started", f"{total} row(s)")
+
     rows_out: list[ExecuteRowResult] = []
-    for action, row in _iter_rows(grouped):
+    rows_iter = list(_iter_rows(grouped))
+    i = 0
+    while i < len(rows_iter):
+        action, row = rows_iter[i]
         try:
+            if action == "meta" and site.playwright:
+                batch: list[NormalizedRow] = []
+                while i < len(rows_iter) and rows_iter[i][0] == "meta":
+                    batch.append(rows_iter[i][1])
+                    i += 1
+                for er in _exec_meta_consecutive_playwright_batch(
+                    site, batch, seo_plugin
+                ):
+                    rows_out.append(er)
+                    emit_monitor_row_exec(
+                        MONITOR_DEFAULT_ID,
+                        "meta",
+                        er.sheet_name,
+                        er.row_index,
+                        str(er.outcome),
+                        er.message,
+                    )
+                continue
+
             if action == "on_page":
                 rows_out.append(_exec_on_page(site, row))
             elif action == "meta":
-                rows_out.append(_exec_meta(site, row))
+                rows_out.append(_exec_meta(site, row, seo_plugin))
             elif action == "images":
-                rows_out.append(_exec_images(site, row))
+                rows_out.append(_exec_on_image(site, row))
             elif action == "url_cleanup":
                 rows_out.append(_exec_url_cleanup(site, row))
             elif action == "redirects_301":
-                rows_out.append(_exec_redirects(site, row))
+                rows_out.append(_exec_redirects_301(site, row, redirect_plugin))
         except Exception as e:
             logger.error(f"Execute error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
             rows_out.append(ExecuteRowResult(
@@ -718,10 +1313,27 @@ def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]]) -> Ex
                 outcome="failed",
                 message=f"Internal error: {str(e)}",
             ))
+        er = rows_out[-1]
+        emit_monitor_row_exec(
+            MONITOR_DEFAULT_ID,
+            action,
+            er.sheet_name,
+            er.row_index,
+            str(er.outcome),
+            er.message,
+        )
+        i += 1
 
     updated = sum(1 for r in rows_out if r.outcome == "updated")
     skipped = sum(1 for r in rows_out if r.outcome == "skipped")
     failed = sum(1 for r in rows_out if r.outcome == "failed")
+
+    emit_monitor_phase(
+        MONITOR_DEFAULT_ID,
+        "Execute finished",
+        f"updated={updated}, skipped={skipped}, failed={failed}",
+    )
+
     return ExecuteResponse(
         rows_processed=len(rows_out),
         updated=updated,

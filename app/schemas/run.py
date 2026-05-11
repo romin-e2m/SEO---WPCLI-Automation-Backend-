@@ -38,14 +38,13 @@ class DryRunResponse(BaseModel):
     blocked: int
     errors: int
     no_change: int
-    detected_meta_plugin: str | None = None
-    meta_description_key: str | None = None
-    redirect_system: str | None = None
     rows: list[DryRunRowResult] = Field(default_factory=list)
 
 
 class DryRunRequest(RunGroupedPayload):
     site: SiteAccess
+    redirect_plugin: str | None = None
+    seo_plugin: str | None = None
 
 
 class ExecuteRowResult(BaseModel):
@@ -73,6 +72,8 @@ class ExecuteRequest(RunGroupedPayload):
         ...,
         description="Must be true to apply writes.",
     )
+    redirect_plugin: str | None = None
+    seo_plugin: str | None = None
 
     @field_validator("confirm_execute")
     @classmethod

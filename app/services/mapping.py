@@ -22,19 +22,17 @@ _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 # `any_of_groups` lets us require "at least one of" for actions like on_page.
 ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
     "on_page": {
-        "label": "On-Page (Title / H1 / Content)",
+        "label": "On-Page (Title / H1)",
         "fields": [
             {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
             {"key": "current_title", "label": "Current title", "required": False, "type": "text"},
             {"key": "recommended_title", "label": "Recommended title", "required": False, "type": "text"},
             {"key": "current_h1", "label": "Current H1", "required": False, "type": "text"},
             {"key": "recommended_h1", "label": "Recommended H1", "required": False, "type": "text"},
-            {"key": "current_content", "label": "Current content", "required": False, "type": "text"},
-            {"key": "recommended_content", "label": "Recommended content", "required": False, "type": "text"},
             {"key": "notes", "label": "Notes", "required": False, "type": "text"},
         ],
         "any_of_groups": [
-            ["recommended_title", "recommended_h1", "recommended_content"],
+            ["recommended_title", "recommended_h1"],
         ],
     },
     "meta": {
@@ -93,14 +91,6 @@ HEADER_ALIASES: dict[str, list[str]] = {
     ],
     "current_h1": ["h1", "current h1"],
     "recommended_h1": ["recommended h1", "new h1", "proposed h1", "h1 (new)"],
-    "current_content": ["content", "current content", "body", "current body"],
-    "recommended_content": [
-        "recommended content",
-        "new content",
-        "proposed content",
-        "updated content",
-        "content (new)",
-    ],
     "current_meta_description": [
         "meta description",
         "current meta description",
