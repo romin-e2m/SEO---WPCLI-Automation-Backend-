@@ -195,9 +195,6 @@ class PlaywrightLogger:
         )
         
         logger.log(log_level, formatted)
-        
-        if self.stream_logs:
-            print(formatted, flush=True)
 
         try:
             from app.services.monitor_broadcast import MONITOR_DEFAULT_ID, emit_monitor_playwright
@@ -209,8 +206,7 @@ class PlaywrightLogger:
     def add_screenshot(self, screenshot_path: str):
         """Record a screenshot path."""
         self.screenshots.append(screenshot_path)
-        if self.stream_logs:
-            print(f"📸 Screenshot: {screenshot_path}", flush=True)
+        logger.debug('Screenshot captured: %s', screenshot_path)
     
     def get_logs(self) -> list[dict[str, Any]]:
         """Return all logs."""

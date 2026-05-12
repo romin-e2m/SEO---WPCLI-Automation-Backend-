@@ -52,6 +52,12 @@ def _s(v: Any) -> str:
     return str(v).strip()
 
 
+# Empty old_* strings are meaningful for execute UI (e.g. missing H1 vs blank meta).
+_DETAIL_PRESERVE_EMPTY_KEYS = frozenset(
+    {"old_title", "old_meta_title", "old_meta_description", "old_alt_text"}
+)
+
+
 def _detail(**kwargs: Any) -> dict[str, Any]:
     """
     Build a `detail` dict for ExecuteRowResult while dropping empty values.
@@ -67,9 +73,21 @@ def _detail(**kwargs: Any) -> dict[str, Any]:
         if value is None:
             continue
         if isinstance(value, str) and value.strip() == "":
+            if key in _DETAIL_PRESERVE_EMPTY_KEYS:
+                out[key] = value
             continue
         out[key] = value
     return out
+
+
+def _on_page_h1_detail_from_dry(dr: DryRunRowResult) -> tuple[str | None, str | None]:
+    """Extract (old_h1, new_h1) strings from dry-run diffs for on_page."""
+    for d in dr.diffs:
+        if d.field == "h1":
+            cur = d.current if d.current is not None else ""
+            prop = d.proposed if d.proposed is not None else ""
+            return cur, prop
+    return None, None
 
 
 def _count_grouped(grouped: dict[str, list[NormalizedRow]]) -> int:
@@ -1489,6 +1507,7 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     summ = WpRestClient.extract_summary_fields(obj)
     raw_content = summ.get("content")
     content = raw_content if isinstance(raw_content, str) else ""
+    old_h1_snapshot = WpRestClient.first_h1_inner_text(content) or ""
 
     new_content = content
     if rec_content:
@@ -1506,7 +1525,13 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
                     outcome="failed",
                     message="No <h1> found to replace.",
                     post_id=pid,
-                    detail=_detail(url=page_url, source_url=page_url, raw_id=pid),
+                    detail=_detail(
+                        url=page_url,
+                        source_url=page_url,
+                        raw_id=pid,
+                        old_title=cur_h1,
+                        new_title=rec_h1,
+                    ),
                 )
             new_content = patched
         else:
@@ -1517,6 +1542,7 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
 
     content_arg = new_content if new_content != content else None
     if content_arg is None:
+        h1_old, h1_new = _on_page_h1_detail_from_dry(dr)
         return ExecuteRowResult(
             action_type="on_page",
             sheet_name=row.sheet_name,
@@ -1524,7 +1550,13 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             outcome="skipped",
             message="No effective changes after re-fetch.",
             post_id=pid,
-            detail=_detail(url=page_url, source_url=page_url, raw_id=pid),
+            detail=_detail(
+                url=page_url,
+                source_url=page_url,
+                raw_id=pid,
+                old_title=h1_old,
+                new_title=h1_new,
+            ),
         )
 
     fields_updated: list[str] = []
@@ -1540,6 +1572,13 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
         logger.info(f"Updated post {pid}: content={bool(content_arg)}, response_id={out.get('id')}")
     except Exception as e:
         logger.error(f"Failed to update post {pid}: {type(e).__name__}: {str(e)}")
+        h1_detail: dict[str, Any] = {}
+        if rec_h1:
+            h1_old, h1_new = _on_page_h1_detail_from_dry(dr)
+            h1_detail["old_title"] = (
+                old_h1_snapshot if h1_old is None else h1_old
+            )
+            h1_detail["new_title"] = rec_h1 if h1_new is None else h1_new
         return ExecuteRowResult(
             action_type="on_page",
             sheet_name=row.sheet_name,
@@ -1551,8 +1590,13 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
                 url=page_url,
                 source_url=page_url,
                 raw_id=pid,
+                **h1_detail,
             ),
         )
+    h1_exec_detail: dict[str, Any] = {}
+    if rec_h1:
+        h1_exec_detail["old_title"] = old_h1_snapshot
+        h1_exec_detail["new_title"] = rec_h1
     return ExecuteRowResult(
         action_type="on_page",
         sheet_name=row.sheet_name,
@@ -1564,6 +1608,7 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             source_url=page_url,
             fields_updated=fields_updated or None,
             raw_id=out.get("id"),
+            **h1_exec_detail,
         ),
     )
 

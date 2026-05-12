@@ -92,21 +92,36 @@ ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
 # canonical_field -> list of header aliases (lower-cased, normalized).
 HEADER_ALIASES: dict[str, list[str]] = {
     "page_url": ["page url", "url", "address", "page", "page address", "landing page"],
-    "current_h1": ["h1", "current h1"],
-    "recommended_h1": ["recommended h1", "new h1", "proposed h1", "h1 (new)"],
+    "current_h1": [
+        "current h1",
+        "h1",
+        "current heading",
+        "heading",
+    ],
+    "recommended_h1": [
+        "recommended h1",
+        "new h1",
+        "proposed h1",
+        "h1 (new)",
+        "recommended heading",
+        "new heading",
+        "proposed heading",
+    ],
     "current_meta_description": [
-        "meta description",
         "current meta description",
-        "description",
+        "meta description",
         "current description",
+        "description",
     ],
     "recommended_meta_description": [
         "recommended meta description",
         "new meta description",
         "proposed meta description",
-        "new meta",
         "meta description (new)",
-        "meta (new)",
+        "recommended description",
+        "new description",
+        "proposed description",
+        "description (new)",
     ],
     "current_meta_title": [
         "meta title",
@@ -192,9 +207,21 @@ def guess_column_map(action_type: ActionType, columns: list[str]) -> dict[str, s
         if n and n not in norm_to_original:
             norm_to_original[n] = c
     out: dict[str, str] = {}
+    
+    # Define fields that should not cross-contaminate
+    # e.g., H1 fields should never match description columns
+    exclusions: dict[str, set[str]] = {
+        "current_meta_description": {"h1", "heading", "title"},
+        "recommended_meta_description": {"h1", "heading", "title"},
+        "current_h1": {"description", "meta", "description"},
+        "recommended_h1": {"description", "meta"},
+    }
+    
     for f in spec["fields"]:
         key: str = f["key"]
         aliases = HEADER_ALIASES.get(key, [])
+        exclude_keywords = exclusions.get(key, set())
+        
         # exact alias match first
         for a in aliases:
             if a in norm_to_original:
@@ -205,9 +232,12 @@ def guess_column_map(action_type: ActionType, columns: list[str]) -> dict[str, s
         # contains-match fallback: header that contains the alias as a whole word
         for a in aliases:
             for n, original in norm_to_original.items():
+                # Check if column matches the alias
                 if re.search(rf"(^|\W){re.escape(a)}($|\W)", n):
-                    out[key] = original
-                    break
+                    # Check if it contains excluded keywords
+                    if not any(excl in n for excl in exclude_keywords):
+                        out[key] = original
+                        break
             if key in out:
                 break
     return out
@@ -223,14 +253,15 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
         if "image" in n or "alt" in n:
             name_hits["images"] = name_hits.get("images", 0) + 5
         if "meta" in n and "description" in n:
-            name_hits["meta"] = name_hits.get("meta", 0) + 5
-        elif n == "meta":
-            name_hits["meta"] = name_hits.get("meta", 0) + 5
+            name_hits["meta"] = name_hits.get("meta", 0) + 20  # Very high priority for explicit "meta description"
+        elif n == "meta" or "meta_desc" in n:
+            name_hits["meta"] = name_hits.get("meta", 0) + 15  # High priority for just "meta" sheet
         if "meta" in n and "title" in n and "description" not in n:
-            name_hits["meta_title"] = name_hits.get("meta_title", 0) + 5
+            name_hits["meta_title"] = name_hits.get("meta_title", 0) + 15  # High priority for "meta title"
         if "url" in n and ("cleanup" in n or "clean" in n or "replace" in n):
             name_hits["url_cleanup"] = name_hits.get("url_cleanup", 0) + 5
-        if "on_page" in n.replace(" ", "_") or "on page" in n or "title" in n or "h1" in n:
+        # Only match on_page if sheet name is NOT about meta or title
+        if ("on_page" in n.replace(" ", "_") or "on page" in n or "h1" in n) and "meta" not in n:
             name_hits["on_page"] = name_hits.get("on_page", 0) + 4
 
     # Score each action by how many of its required fields are matchable.
@@ -245,11 +276,17 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
     best: ActionType | None = None
     best_score = -1
     for action in ACTION_FIELDS.keys():
-        score = col_hits.get(action, 0) * 2 + name_hits.get(action, 0)
+        # If sheet name strongly suggests an action, weight name detection heavily
+        name_score = name_hits.get(action, 0)
+        col_score = col_hits.get(action, 0)
+        # Name detection gets 3x weight over column detection for explicit matches
+        score = col_score * 2 + name_score * 3
+        
         # require at least all required mapped to be a confident pick
         spec = ACTION_FIELDS[action]
         required_keys = [f["key"] for f in spec["fields"] if f["required"]]
-        if col_hits.get(action, 0) < len(required_keys):
+        if col_score < len(required_keys) and name_score < 10:
+            # Only penalize if both name AND column detection are weak
             score = score - 10
         if score > best_score:
             best_score = score
