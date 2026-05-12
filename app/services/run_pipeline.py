@@ -5,6 +5,7 @@ import html
 import logging
 import os
 import re
+import unicodedata
 from typing import Any
 
 from app.schemas.run import (
@@ -50,6 +51,22 @@ def _s(v: Any) -> str:
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _normalize_for_comparison(s: str) -> str:
+    """
+    Normalize a string for comparison.
+    - NFC unicode normalization (resolves composed vs decomposed chars)
+    - Collapse all Unicode dash variants (en-dash, em-dash, figure dash, etc.) to plain hyphen
+    - Collapse multiple whitespace to single space
+    - Strip leading/trailing whitespace
+    """
+    s = unicodedata.normalize("NFC", s)
+    # Replace all Unicode dashes with plain hyphen
+    s = re.sub(r"[‐-―−﹘﹣－]", "-", s)
+    # Collapse multiple spaces/tabs
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
 # Empty old_* strings are meaningful for execute UI (e.g. missing H1 vs blank meta).
@@ -121,6 +138,21 @@ def _iter_rows(grouped: dict[str, list[NormalizedRow]]):
 def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     v = row.values
     page_url = _s(v.get("page_url"))
+    current_h1_from_sheet = _s(v.get("current_h1"))
+    rec_h1 = _s(v.get("recommended_h1"))
+    rec_content = _s(v.get("recommended_content"))
+
+    # First check: compare Excel current vs Excel recommended
+    # If they are the same, skip this row
+    if current_h1_from_sheet and rec_h1 and current_h1_from_sheet == rec_h1:
+        return DryRunRowResult(
+            action_type="on_page",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="skip",
+            message="Current H1 in sheet matches recommended H1 - already updated.",
+        )
+
     res = resolve_post_url(site, page_url)
     if not res.found or not res.post:
         return DryRunRowResult(
@@ -149,14 +181,23 @@ def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     summ = WpRestClient.extract_summary_fields(obj)
     raw_content = summ.get("content")
     cur_content = raw_content if isinstance(raw_content, str) else ""
-    cur_h1 = WpRestClient.first_h1_inner_text(cur_content) or ""
+    wp_cur_h1 = WpRestClient.first_h1_inner_text(cur_content) or ""
 
-    rec_h1 = _s(v.get("recommended_h1"))
-    rec_content = _s(v.get("recommended_content"))
+    # Second check: verify Excel current matches WordPress current
+    if current_h1_from_sheet and wp_cur_h1 and current_h1_from_sheet != wp_cur_h1:
+        return DryRunRowResult(
+            action_type="on_page",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message=f"Current H1 in sheet doesn't match WordPress: sheet='{current_h1_from_sheet}' vs wp='{wp_cur_h1}'",
+            post_id=pid,
+            resolution_method=res.method,
+        )
 
     diffs: list[FieldDiff] = []
-    if rec_h1 and rec_h1 != cur_h1:
-        diffs.append(FieldDiff(field="h1", current=cur_h1, proposed=rec_h1))
+    if rec_h1 and rec_h1 != wp_cur_h1:
+        diffs.append(FieldDiff(field="h1", current=current_h1_from_sheet or wp_cur_h1, proposed=rec_h1))
     if rec_content and rec_content != cur_content:
         diffs.append(FieldDiff(field="content", current="(HTML body)", proposed="(replace entire body)"))
 
@@ -326,6 +367,7 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     """Dry-run for meta description updates."""
     v = row.values
     page_url = _s(v.get("page_url"))
+    current_meta_from_sheet = _s(v.get("current_meta_description"))
     rec_meta = _s(v.get("recommended_meta_description"))
 
     if not page_url:
@@ -344,6 +386,17 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
             row_index=row.row_index,
             outcome="blocked",
             message="Recommended meta description is missing.",
+        )
+
+    # First check: compare Excel current vs Excel recommended
+    # If they are the same, skip this row
+    if current_meta_from_sheet and rec_meta and current_meta_from_sheet == rec_meta:
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="skip",
+            message="Current meta description in sheet matches recommended meta description - already updated.",
         )
 
     res = resolve_post_url(site, page_url)
@@ -374,29 +427,41 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
 
     # Try to extract existing meta description from multiple sources
     # Plugin-specific meta fields
-    cur_meta = ""
+    wp_cur_meta = ""
     
     # Check Yoast SEO
     yoast_meta = obj.get("meta", {})
     if isinstance(yoast_meta, dict):
         # Yoast stores in _yoast_wpseo_metadesc
-        cur_meta = _s(yoast_meta.get("_yoast_wpseo_metadesc", ""))
+        wp_cur_meta = _s(yoast_meta.get("_yoast_wpseo_metadesc", ""))
     
     # Check Rank Math
-    if not cur_meta and isinstance(yoast_meta, dict):
-        cur_meta = _s(yoast_meta.get("rank_math_description", "")) or _s(yoast_meta.get("_rank_math_description", ""))
+    if not wp_cur_meta and isinstance(yoast_meta, dict):
+        wp_cur_meta = _s(yoast_meta.get("rank_math_description", "")) or _s(yoast_meta.get("_rank_math_description", ""))
     
     # Check SEOPress
-    if not cur_meta and isinstance(yoast_meta, dict):
-        cur_meta = _s(yoast_meta.get("_seopress_titles_desc", ""))
+    if not wp_cur_meta and isinstance(yoast_meta, dict):
+        wp_cur_meta = _s(yoast_meta.get("_seopress_titles_desc", ""))
     
     # Fallback: Check yoast_head_json (rendered meta from Yoast)
-    if not cur_meta:
+    if not wp_cur_meta:
         yoast_head_json = obj.get("yoast_head_json", {})
         if isinstance(yoast_head_json, dict):
-            cur_meta = _s(yoast_head_json.get("description", ""))
+            wp_cur_meta = _s(yoast_head_json.get("description", ""))
 
-    if rec_meta == cur_meta:
+    # Second check: verify Excel current matches WordPress current
+    if current_meta_from_sheet and wp_cur_meta and _normalize_for_comparison(current_meta_from_sheet) != _normalize_for_comparison(wp_cur_meta):
+        return DryRunRowResult(
+            action_type="meta",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message=f"Current meta description in sheet doesn't match WordPress: sheet='{current_meta_from_sheet}' vs wp='{wp_cur_meta}'",
+            post_id=pid,
+            resolution_method=res.method,
+        )
+
+    if _normalize_for_comparison(rec_meta) == _normalize_for_comparison(wp_cur_meta):
         return DryRunRowResult(
             action_type="meta",
             sheet_name=row.sheet_name,
@@ -413,7 +478,7 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         outcome="change",
         post_id=pid,
         resolution_method=res.method,
-        diffs=[FieldDiff(field="meta_description", current=cur_meta, proposed=rec_meta)],
+        diffs=[FieldDiff(field="meta_description", current=current_meta_from_sheet or wp_cur_meta, proposed=rec_meta)],
     )
 
 
@@ -421,6 +486,7 @@ def _dry_meta_title(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     """Dry-run for SEO title (meta title) updates."""
     v = row.values
     page_url = _s(v.get("page_url"))
+    current_title_from_sheet = _s(v.get("current_meta_title"))
     rec_title = _s(v.get("recommended_meta_title"))
 
     if not page_url:
@@ -439,6 +505,17 @@ def _dry_meta_title(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
             row_index=row.row_index,
             outcome="blocked",
             message="Recommended meta title is missing.",
+        )
+
+    # First check: compare Excel current vs Excel recommended
+    # If they are the same, skip this row
+    if current_title_from_sheet and rec_title and current_title_from_sheet == rec_title:
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="skip",
+            message="Current meta title in sheet matches recommended meta title - already updated.",
         )
 
     res = resolve_post_url(site, page_url)
@@ -467,22 +544,34 @@ def _dry_meta_title(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
             resolution_method=res.method,
         )
 
-    cur_title = ""
+    wp_cur_title = ""
     yoast_meta = obj.get("meta", {})
     if isinstance(yoast_meta, dict):
-        cur_title = _s(yoast_meta.get("_yoast_wpseo_title", ""))
-    if not cur_title and isinstance(yoast_meta, dict):
-        cur_title = _s(yoast_meta.get("rank_math_title", "")) or _s(
+        wp_cur_title = _s(yoast_meta.get("_yoast_wpseo_title", ""))
+    if not wp_cur_title and isinstance(yoast_meta, dict):
+        wp_cur_title = _s(yoast_meta.get("rank_math_title", "")) or _s(
             yoast_meta.get("_rank_math_title", "")
         )
-    if not cur_title and isinstance(yoast_meta, dict):
-        cur_title = _s(yoast_meta.get("_seopress_titles_title", ""))
-    if not cur_title:
+    if not wp_cur_title and isinstance(yoast_meta, dict):
+        wp_cur_title = _s(yoast_meta.get("_seopress_titles_title", ""))
+    if not wp_cur_title:
         yoast_head_json = obj.get("yoast_head_json", {})
         if isinstance(yoast_head_json, dict):
-            cur_title = _s(yoast_head_json.get("title", ""))
+            wp_cur_title = _s(yoast_head_json.get("title", ""))
 
-    if rec_title == cur_title:
+    # Second check: verify Excel current matches WordPress current
+    if current_title_from_sheet and wp_cur_title and _normalize_for_comparison(current_title_from_sheet) != _normalize_for_comparison(wp_cur_title):
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message=f"Current meta title in sheet doesn't match WordPress: sheet='{current_title_from_sheet}' vs wp='{wp_cur_title}'",
+            post_id=pid,
+            resolution_method=res.method,
+        )
+
+    if _normalize_for_comparison(rec_title) == _normalize_for_comparison(wp_cur_title):
         return DryRunRowResult(
             action_type="meta_title",
             sheet_name=row.sheet_name,
@@ -499,7 +588,7 @@ def _dry_meta_title(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         outcome="change",
         post_id=pid,
         resolution_method=res.method,
-        diffs=[FieldDiff(field="meta_title", current=cur_title, proposed=rec_title)],
+        diffs=[FieldDiff(field="meta_title", current=current_title_from_sheet or wp_cur_title, proposed=rec_title)],
     )
 
 

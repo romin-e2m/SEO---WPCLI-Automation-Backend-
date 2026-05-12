@@ -135,8 +135,9 @@ def _connection_help(base_url: str) -> str | None:
 
 
 def _html_plain_text(s: str) -> str:
-    """Strip HTML tags; non-empty string in, plain text out."""
-    return re.sub(r"<[^>]*>", "", s).strip()
+    """Strip HTML tags and decode HTML entities; non-empty string in, plain text out."""
+    stripped = re.sub(r"<[^>]*>", "", s).strip()
+    return html.unescape(stripped)
 
 
 def _strip_html(s: str | None) -> str | None:
