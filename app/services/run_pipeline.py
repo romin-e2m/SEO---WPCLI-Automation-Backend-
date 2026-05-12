@@ -16,7 +16,7 @@ from app.schemas.run import (
 )
 from app.schemas.workbook import NormalizedRow
 from app.schemas.wp import SiteAccess
-from app.services.wp_rest import WpRestClient, _redirect_rest_backends, strip_html_tags
+from app.services.wp_rest import WpRestClient, _redirect_rest_backends
 from app.services.wp_site import resolve_post_url, rest_client
 from app.services.wp_playwright import (
     extract_slug_with_trailing_slash,
@@ -36,11 +36,6 @@ from app.services.execution_logger import ExecutionLogger
 logger = logging.getLogger(__name__)
 
 _ORDER = ("on_page", "meta", "meta_title", "images", "url_cleanup", "redirects_301")
-
-# Actions that update mutually-exclusive fields on a single post/page.
-# Two rows targeting the same post id for any of these actions would silently
-# overwrite each other; flag the second one as a conflict instead.
-_DEDUP_BY_POST_ID_ACTIONS = frozenset({"on_page", "meta", "meta_title"})
 
 
 def _max_run_rows() -> int:
@@ -86,79 +81,13 @@ def _detail(**kwargs: Any) -> dict[str, Any]:
 
 
 def _on_page_h1_detail_from_dry(dr: DryRunRowResult) -> tuple[str | None, str | None]:
-    """Extract (old_h1, new_h1) strings from dry-run diffs for on_page.
-
-    Prefer the ``h1`` (content) diff; fall back to the ``title`` diff so the UI still
-    shows a sensible before/after when only the title is changing.
-    """
-    cur_fallback: str | None = None
-    prop_fallback: str | None = None
+    """Extract (old_h1, new_h1) strings from dry-run diffs for on_page."""
     for d in dr.diffs:
         if d.field == "h1":
             cur = d.current if d.current is not None else ""
             prop = d.proposed if d.proposed is not None else ""
             return cur, prop
-        if d.field == "title" and cur_fallback is None:
-            cur_fallback = d.current if d.current is not None else ""
-            prop_fallback = d.proposed if d.proposed is not None else ""
-    return cur_fallback, prop_fallback
-
-
-_HOMEPAGE_BLOCK_MESSAGES: dict[str, str] = {
-    "homepage_is_blog_index": (
-        "Homepage is set to 'Your latest posts' in WP Settings → Reading, so the site root has "
-        "no single page to update. Switch to a static front page and re-run, or remove this row."
-    ),
-    "homepage_static_page_not_configured": (
-        "WP Settings → Reading has 'A static page' selected but no page chosen as Homepage. "
-        "Assign a homepage page in WP and re-run."
-    ),
-    "homepage_static_page_fetch_failed": (
-        "Site root resolved to a static front page, but that page could not be fetched via REST. "
-        "Open WP Settings → Reading and confirm the Homepage selection is valid."
-    ),
-    "homepage_settings_forbidden": (
-        "Cannot read WP Settings → Reading (REST returned 401/403). The Application Password user "
-        "needs the manage_options capability to read site settings."
-    ),
-    "homepage_settings_unreachable": (
-        "Could not reach WP Settings → Reading to determine the homepage. Verify the site URL and "
-        "REST credentials, then retry."
-    ),
-    "homepage_settings_error": (
-        "WP Settings → Reading returned an unexpected error while resolving the homepage."
-    ),
-    "homepage_settings_invalid_json": (
-        "WP Settings → Reading returned invalid JSON while resolving the homepage."
-    ),
-    "homepage_resolved_to_page_but_post_required": (
-        "Site root maps to a static page, but this row requires a post (not a page)."
-    ),
-}
-
-
-def _resolution_message(method: str | None, default: str) -> str:
-    """Return a human-readable explanation for a non-found resolution method."""
-    if method and method in _HOMEPAGE_BLOCK_MESSAGES:
-        return _HOMEPAGE_BLOCK_MESSAGES[method]
-    return default
-
-
-def _homepage_action_message(action: str | None, rec_h1: str) -> str:
-    """Pretty message describing what the homepage auto-config did."""
-    if action == "created_new":
-        return (
-            f"Created a new static page '{rec_h1}' and set it as the homepage "
-            f"(Settings → Reading)."
-        )
-    if action == "promoted_existing":
-        return (
-            f"Promoted an existing page to homepage and updated it to '{rec_h1}' "
-            f"(Settings → Reading)."
-        )
-    if action == "found_existing":
-        return f"Updated the existing homepage page to '{rec_h1}'."
-    return f"Homepage configured: {action}."
+    return None, None
 
 
 def _count_grouped(grouped: dict[str, list[NormalizedRow]]) -> int:
@@ -189,78 +118,17 @@ def _iter_rows(grouped: dict[str, list[NormalizedRow]]):
             yield key, row
 
 
-def _is_site_root_url(url: str) -> bool:
-    """Return True when ``url`` points at the site root (``http://site``/``http://site/``)."""
-    if not url:
-        return False
-    try:
-        from urllib.parse import urlsplit
-        parsed = urlsplit(url.strip())
-    except Exception:
-        return False
-    if not parsed.netloc:
-        return False
-    return (parsed.path or "").strip() in {"", "/"}
-
-
-def _raw_title_from_post(post_obj: dict[str, Any]) -> str:
-    """Return the unfiltered post title when available (``context=edit`` exposes ``raw``).
-
-    Falls back to a plain-text version of ``title.rendered`` so theme/plugin filters that
-    append the site name don't pollute diff comparisons.
-    """
-    title_obj = post_obj.get("title")
-    if isinstance(title_obj, dict):
-        raw = title_obj.get("raw")
-        if isinstance(raw, str) and raw:
-            return raw
-        rendered = title_obj.get("rendered")
-        if isinstance(rendered, str) and rendered:
-            return strip_html_tags(rendered)
-    return ""
-
-
 def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     v = row.values
     page_url = _s(v.get("page_url"))
-    rec_h1 = _s(v.get("recommended_h1"))
     res = resolve_post_url(site, page_url)
     if not res.found or not res.post:
-        # Auto-config preview: homepage is a blog index but we can promote/create a
-        # static page during execute. Show the change in dry-run instead of blocking.
-        if (
-            _is_site_root_url(page_url)
-            and rec_h1
-            and res.method == "homepage_is_blog_index"
-        ):
-            return DryRunRowResult(
-                action_type="on_page",
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="change",
-                message=(
-                    f"WP homepage is currently 'Your latest posts'. Execute will set up a "
-                    f"static page titled '{rec_h1}' and wire it as the homepage."
-                ),
-                resolution_method="homepage_auto_configure",
-                diffs=[
-                    FieldDiff(
-                        field="homepage_setup",
-                        current="(blog index — no static page)",
-                        proposed=f"static page '{rec_h1}' set as homepage",
-                    ),
-                    FieldDiff(field="title", current="", proposed=rec_h1),
-                    FieldDiff(field="h1", current="", proposed=rec_h1),
-                ],
-            )
         return DryRunRowResult(
             action_type="on_page",
             sheet_name=row.sheet_name,
             row_index=row.row_index,
             outcome="blocked",
-            message=_resolution_message(
-                res.method, "Could not resolve page URL to a post or page."
-            ),
+            message="Could not resolve page URL to a post or page.",
             resolution_method=res.method,
         )
     pid = res.post.id
@@ -282,16 +150,13 @@ def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
     raw_content = summ.get("content")
     cur_content = raw_content if isinstance(raw_content, str) else ""
     cur_h1 = WpRestClient.first_h1_inner_text(cur_content) or ""
-    cur_title = _raw_title_from_post(obj)
 
+    rec_h1 = _s(v.get("recommended_h1"))
     rec_content = _s(v.get("recommended_content"))
 
     diffs: list[FieldDiff] = []
-    if rec_h1:
-        if rec_h1 != cur_h1:
-            diffs.append(FieldDiff(field="h1", current=cur_h1, proposed=rec_h1))
-        if rec_h1 != cur_title:
-            diffs.append(FieldDiff(field="title", current=cur_title, proposed=rec_h1))
+    if rec_h1 and rec_h1 != cur_h1:
+        diffs.append(FieldDiff(field="h1", current=cur_h1, proposed=rec_h1))
     if rec_content and rec_content != cur_content:
         diffs.append(FieldDiff(field="content", current="(HTML body)", proposed="(replace entire body)"))
 
@@ -1607,47 +1472,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     rec_h1 = _s(v.get("recommended_h1"))
     rec_content = _s(v.get("recommended_content"))
 
-    # When the workbook targets the site root and WP's "Settings → Reading" is set
-    # to "Your latest posts" (a blog index, not a single page), auto-configure a
-    # static front page now so the row has something concrete to update. This is the
-    # path that the dry-run advertises as ``resolution_method="homepage_auto_configure"``.
-    homepage_action: str | None = None
-    if rec_h1 and _is_site_root_url(page_url):
-        try:
-            setup_client = rest_client(site)
-            settings = setup_client.get_settings()
-            show_on_front = (settings or {}).get("show_on_front") or "posts"
-            page_on_front = (settings or {}).get("page_on_front")
-            already_configured = (
-                show_on_front == "page"
-                and isinstance(page_on_front, int)
-                and page_on_front > 0
-            )
-            if not already_configured:
-                preferred_content = rec_content or (
-                    f"<h1>{html.escape(rec_h1, quote=False)}</h1>"
-                )
-                page_obj, homepage_action = setup_client.ensure_static_homepage(
-                    preferred_title=rec_h1,
-                    preferred_content=preferred_content,
-                )
-                logger.info(
-                    f"Homepage auto-configured: action={homepage_action}, "
-                    f"page_id={(page_obj or {}).get('id')}"
-                )
-        except Exception as e:
-            logger.error(
-                f"Homepage auto-config failed: {type(e).__name__}: {e}"
-            )
-            return ExecuteRowResult(
-                action_type="on_page",
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="failed",
-                message=f"Could not auto-configure homepage: {e}",
-                detail=_detail(url=page_url, source_url=page_url),
-            )
-
     dr = _dry_on_page(site, row)
     if dr.outcome == "blocked":
         return ExecuteRowResult(
@@ -1659,26 +1483,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             detail=_detail(url=page_url, source_url=page_url),
         )
     if dr.outcome == "no_change":
-        # If we just promoted/created a homepage page, surface it as ``updated``
-        # even when title/content already match — wiring the front page is itself
-        # a meaningful change for the user.
-        if homepage_action:
-            return ExecuteRowResult(
-                action_type="on_page",
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="updated",
-                message=_homepage_action_message(homepage_action, rec_h1),
-                post_id=dr.post_id,
-                detail=_detail(
-                    url=page_url,
-                    source_url=page_url,
-                    raw_id=dr.post_id,
-                    homepage_action=homepage_action,
-                    new_title=rec_h1,
-                    fields_updated=["homepage_setup"],
-                ),
-            )
         return ExecuteRowResult(
             action_type="on_page",
             sheet_name=row.sheet_name,
@@ -1704,7 +1508,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     raw_content = summ.get("content")
     content = raw_content if isinstance(raw_content, str) else ""
     old_h1_snapshot = WpRestClient.first_h1_inner_text(content) or ""
-    old_title_snapshot = _raw_title_from_post(obj)
 
     new_content = content
     if rec_content:
@@ -1712,6 +1515,7 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     if rec_h1:
         cur_h1 = WpRestClient.first_h1_inner_text(new_content)
         if cur_h1:
+            # H1 tag exists, replace it
             patched, ok = WpRestClient.replace_first_h1_inner(new_content, rec_h1)
             if not ok:
                 return ExecuteRowResult(
@@ -1731,16 +1535,13 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
                 )
             new_content = patched
         else:
+            # No H1 tag exists, create one at the beginning of content
             escaped_h1 = html.escape(rec_h1, quote=False)
             h1_html = f"<h1>{escaped_h1}</h1>"
             new_content = h1_html + "\n" + new_content
 
     content_arg = new_content if new_content != content else None
-    # Most WP themes render the visible H1 from the post title, so always push
-    # ``recommended_h1`` to the title field as well (skipping no-ops).
-    title_arg = rec_h1 if rec_h1 and rec_h1 != old_title_snapshot else None
-
-    if content_arg is None and title_arg is None:
+    if content_arg is None:
         h1_old, h1_new = _on_page_h1_detail_from_dry(dr)
         return ExecuteRowResult(
             action_type="on_page",
@@ -1759,28 +1560,23 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
         )
 
     fields_updated: list[str] = []
-    if homepage_action:
-        fields_updated.append("homepage_setup")
-    if title_arg is not None:
-        fields_updated.append("title")
-    if rec_h1 and content_arg is not None:
+    if rec_h1:
         fields_updated.append("h1")
-    if rec_content and content_arg is not None and "content" not in fields_updated:
-        fields_updated.append("content")
+    if content_arg is not None and "content" not in fields_updated:
+        # Only flag content separately if the body itself was replaced.
+        if rec_content:
+            fields_updated.append("content")
 
     try:
-        out = client.update_post(pid, title=title_arg, content=content_arg)
-        logger.info(
-            f"Updated post {pid}: title={bool(title_arg)}, content={bool(content_arg)}, "
-            f"response_id={out.get('id')}"
-        )
+        out = client.update_post(pid, title=None, content=content_arg)
+        logger.info(f"Updated post {pid}: content={bool(content_arg)}, response_id={out.get('id')}")
     except Exception as e:
         logger.error(f"Failed to update post {pid}: {type(e).__name__}: {str(e)}")
         h1_detail: dict[str, Any] = {}
         if rec_h1:
             h1_old, h1_new = _on_page_h1_detail_from_dry(dr)
             h1_detail["old_title"] = (
-                old_h1_snapshot or old_title_snapshot if h1_old is None else h1_old
+                old_h1_snapshot if h1_old is None else h1_old
             )
             h1_detail["new_title"] = rec_h1 if h1_new is None else h1_new
         return ExecuteRowResult(
@@ -1794,30 +1590,24 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
                 url=page_url,
                 source_url=page_url,
                 raw_id=pid,
-                homepage_action=homepage_action,
                 **h1_detail,
             ),
         )
     h1_exec_detail: dict[str, Any] = {}
     if rec_h1:
-        h1_exec_detail["old_title"] = old_title_snapshot or old_h1_snapshot
+        h1_exec_detail["old_title"] = old_h1_snapshot
         h1_exec_detail["new_title"] = rec_h1
-    success_message = (
-        _homepage_action_message(homepage_action, rec_h1) if homepage_action else None
-    )
     return ExecuteRowResult(
         action_type="on_page",
         sheet_name=row.sheet_name,
         row_index=row.row_index,
         outcome="updated",
-        message=success_message,
         post_id=pid,
         detail=_detail(
             url=page_url,
             source_url=page_url,
             fields_updated=fields_updated or None,
             raw_id=out.get("id"),
-            homepage_action=homepage_action,
             **h1_exec_detail,
         ),
     )
@@ -2335,55 +2125,6 @@ def run_execute(
             "execute_started", "pending", f"{total} row(s) to process"
         )
 
-    # Track post ids already consumed by a write within this run, per action.
-    # Used to flag duplicate rows (which would otherwise silently overwrite each other)
-    # as conflicts before we make the second REST call.
-    seen_post_ids_per_action: dict[str, dict[int, int]] = {}
-
-    def _conflict_pre_check(action: str, row: NormalizedRow) -> ExecuteRowResult | None:
-        if action not in _DEDUP_BY_POST_ID_ACTIONS:
-            return None
-        page_url = _s(row.values.get("page_url"))
-        if not page_url:
-            return None
-        try:
-            res = resolve_post_url(site, page_url)
-        except Exception:
-            return None
-        if not res.found or not res.post:
-            return None
-        seen = seen_post_ids_per_action.setdefault(action, {})
-        prior_row_index = seen.get(res.post.id)
-        if prior_row_index is None:
-            return None
-        return ExecuteRowResult(
-            action_type=action,
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="failed",
-            message=(
-                f"Conflict: row {prior_row_index} in this run already updated post id "
-                f"{res.post.id} for '{action}'. Skipping to avoid silently overwriting "
-                f"that change. Resolve the duplicate URL in your workbook and re-run."
-            ),
-            post_id=res.post.id,
-            detail=_detail(
-                url=page_url,
-                source_url=page_url,
-                raw_id=res.post.id,
-                conflicts_with_row=prior_row_index,
-            ),
-        )
-
-    def _register_seen(er: ExecuteRowResult) -> None:
-        if er.action_type not in _DEDUP_BY_POST_ID_ACTIONS:
-            return
-        if er.outcome != "updated" or er.post_id is None:
-            return
-        seen_post_ids_per_action.setdefault(er.action_type, {}).setdefault(
-            er.post_id, er.row_index
-        )
-
     rows_out: list[ExecuteRowResult] = []
     try:
         rows_iter = list(_iter_rows(grouped))
@@ -2391,21 +2132,6 @@ def run_execute(
         while i < len(rows_iter):
             action, row = rows_iter[i]
             try:
-                conflict = _conflict_pre_check(action, row)
-                if conflict is not None:
-                    rows_out.append(conflict)
-                    emit_monitor_row_exec(
-                        MONITOR_DEFAULT_ID,
-                        conflict.action_type,
-                        conflict.sheet_name,
-                        conflict.row_index,
-                        str(conflict.outcome),
-                        conflict.message,
-                    )
-                    _log_row(conflict)
-                    i += 1
-                    continue
-
                 if action == "meta" and site.playwright:
                     batch: list[NormalizedRow] = []
                     while i < len(rows_iter) and rows_iter[i][0] == "meta":
@@ -2424,7 +2150,6 @@ def run_execute(
                             er.message,
                         )
                         _log_row(er)
-                        _register_seen(er)
                     continue
 
                 if action == "meta_title" and site.playwright:
@@ -2445,7 +2170,6 @@ def run_execute(
                             er.message,
                         )
                         _log_row(er)
-                        _register_seen(er)
                     continue
 
                 if action == "on_page":
@@ -2483,7 +2207,6 @@ def run_execute(
                 er.message,
             )
             _log_row(er)
-            _register_seen(er)
             i += 1
 
         updated = sum(1 for r in rows_out if r.outcome == "updated")

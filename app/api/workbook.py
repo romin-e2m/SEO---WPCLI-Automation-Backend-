@@ -18,6 +18,7 @@ from app.services.excel_ingest import (
     read_full_sheets,
 )
 from app.services.mapping import (
+    ACTION_FIELDS,
     action_fields_descriptor,
     guess_action_type,
     guess_column_map,
@@ -63,6 +64,11 @@ def _decorate_with_suggestions(sheet: SheetPreview, manager: Any = None) -> Shee
                             break
                     if field.key in col_map:
                         break
+            # Key-alias matching misses short headers like "H1" for current_h1; merge static guesses.
+            if schema.id in ACTION_FIELDS:
+                for k, v in guess_column_map(schema.id, sheet.columns).items():
+                    if k not in col_map and v:
+                        col_map[k] = v
             sheet.suggested_column_map = col_map
             return sheet
     
