@@ -18,6 +18,7 @@ extra/
 test_*.py
 *_test.py
 test_playwright_system.py
+inspect_meta_fields.py
 
 # Graphify (local-only; never commit)
 graphify-out/
@@ -29,3 +30,4 @@ graphify-out/
 CLAUDE.md
 .cursor/rules/graphify.mdc
 .claude/settings.json
+graphify-out.zip

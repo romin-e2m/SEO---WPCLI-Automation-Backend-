@@ -760,8 +760,10 @@ class WpRestClient:
             if not detected_seo_plugins:
                 logger.warning(f"No SEO plugin detected on post {post_id}. SEO title cannot be updated.")
                 return post_obj
+            
             logger.warning(
-                f"REST API SEO title update for post {post_id} failed for all {detected_seo_plugins} fields."
+                f"REST API SEO title update for post {post_id} failed for all {detected_seo_plugins} fields. "
+                f"This is likely due to REST API permission restrictions on private meta fields."
             )
             return post_obj
 

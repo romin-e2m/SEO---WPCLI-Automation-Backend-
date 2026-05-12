@@ -691,6 +691,37 @@ def _exec_meta_via_rest(
                 detail=_detail(**base_detail, raw_id=post_id_returned),
             )
 
+        # Verify the meta was actually updated by checking the returned object
+        meta_fields = obj.get("meta") or {}
+        updated_meta = (
+            meta_fields.get("rank_math_description", "") or
+            meta_fields.get("_rank_math_description", "") or
+            meta_fields.get("_yoast_wpseo_metadesc", "") or
+            meta_fields.get("_seopress_titles_desc", "")
+        )
+        
+        # If no meta field was updated, check yoast_head_json as fallback
+        if not updated_meta:
+            yoast_head = obj.get("yoast_head_json") or {}
+            updated_meta = yoast_head.get("description", "")
+        
+        # If still no meta or doesn't match what we tried to set, REST API likely failed
+        if not updated_meta or _normalize_for_comparison(updated_meta) != _normalize_for_comparison(rec_meta):
+            logger.warning(
+                f"REST API meta update for post {pid} did not persist. "
+                f"Expected: '{rec_meta}', Got: '{updated_meta}'. "
+                f"This is likely due to REST API permission restrictions on private meta fields."
+            )
+            return ExecuteRowResult(
+                action_type="meta",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="REST API meta update did not persist (permission restrictions - try Playwright/WP-CLI)",
+                post_id=pid,
+                detail=_detail(**base_detail, raw_id=post_id_returned),
+            )
+
         logger.info("Successfully updated post %s meta description (REST)", pid)
 
     except Exception as e:
@@ -1071,6 +1102,38 @@ def _exec_meta_title_via_rest(
                 post_id=pid,
                 detail=_detail(**base_detail, raw_id=post_id_returned),
             )
+        
+        # Verify the title was actually updated by checking the returned object
+        meta_fields = obj.get("meta") or {}
+        updated_title = (
+            meta_fields.get("rank_math_title", "") or
+            meta_fields.get("_rank_math_title", "") or
+            meta_fields.get("_yoast_wpseo_title", "") or
+            meta_fields.get("_seopress_titles_title", "")
+        )
+        
+        # If no meta field was updated, check yoast_head_json as fallback
+        if not updated_title:
+            yoast_head = obj.get("yoast_head_json") or {}
+            updated_title = yoast_head.get("title", "")
+        
+        # If still no title or doesn't match what we tried to set, REST API likely failed
+        if not updated_title or _normalize_for_comparison(updated_title) != _normalize_for_comparison(rec_title):
+            logger.warning(
+                f"REST API SEO title update for post {pid} did not persist. "
+                f"Expected: '{rec_title}', Got: '{updated_title}'. "
+                f"This is likely due to REST API permission restrictions on private meta fields."
+            )
+            return ExecuteRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="REST API SEO title update did not persist (permission restrictions - try Playwright/WP-CLI)",
+                post_id=pid,
+                detail=_detail(**base_detail, raw_id=post_id_returned),
+            )
+        
         logger.info("Successfully updated post %s SEO title (REST)", pid)
     except Exception as e:
         logger.error(

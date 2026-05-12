@@ -949,29 +949,92 @@ class WordPressPlaywright:
         self, loc, text: str
     ) -> bool:
         """
-        Set text on a React-controlled contenteditable when keyboard interaction misses the node.
-        Dispatches input events Yoast's listeners may rely on.
+        Set text on a React/Draft.js controlled contenteditable when keyboard interaction misses the node.
+        Yoast uses Draft.js which requires specific event handling.
+        IMPORTANT: Must select all existing content, delete it, then insert new text.
         """
         try:
+            # First, click to focus and ensure element is active
+            await loc.click(force=True)
+            await loc.evaluate("el => el.focus()")
+            
+            # Now use the evaluate to select all and replace
             return bool(
                 await loc.evaluate(
                     """(el, txt) => {
                     const t = String(txt ?? '');
+                    
+                    // Ensure focus
                     el.focus();
+                    
+                    // Step 1: Select all content using keyboard shortcut simulation
+                    // Create and dispatch Ctrl+A keydown event
+                    const selectAllEvent = new KeyboardEvent('keydown', {
+                      key: 'a',
+                      code: 'KeyA',
+                      keyCode: 65,
+                      ctrlKey: true,
+                      bubbles: true,
+                      cancelable: true,
+                    });
+                    el.dispatchEvent(selectAllEvent);
+                    
+                    // Step 2: Use getSelection API to select all
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    
+                    // Step 3: Delete selected content by dispatching beforeinput with deleteByCut
+                    const deleteEvent = new InputEvent('beforeinput', {
+                      bubbles: true,
+                      cancelable: true,
+                      inputType: 'deleteByCut',
+                    });
+                    el.dispatchEvent(deleteEvent);
+                    
+                    // Step 4: Clear the element completely
+                    el.innerHTML = '';
+                    el.textContent = '';
+                    
+                    // Step 5: Insert new text
                     el.textContent = t;
-                    el.dispatchEvent(new InputEvent('input', {
+                    
+                    // Step 6: Dispatch input events to notify Draft.js of the change
+                    const inputEvent = new InputEvent('input', {
                       bubbles: true,
                       cancelable: true,
                       inputType: 'insertText',
                       data: t,
+                    });
+                    el.dispatchEvent(inputEvent);
+                    
+                    // Dispatch additional events for React/Draft.js
+                    el.dispatchEvent(new Event('beforeinput', {
+                      bubbles: true,
+                      cancelable: true,
                     }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    
+                    el.dispatchEvent(new Event('input', {
+                      bubbles: true,
+                    }));
+                    
+                    el.dispatchEvent(new Event('change', {
+                      bubbles: true,
+                    }));
+                    
+                    el.dispatchEvent(new Event('blur', {
+                      bubbles: true,
+                    }));
+                    
+                    // Verify the change
                     return (el.textContent || '').trim() === t.trim();
                 }""",
                     text,
                 )
             )
-        except Exception:
+        except Exception as e:
             return False
 
     async def _scroll_to_block_editor_metaboxes(self, page: Page) -> None:
@@ -1001,8 +1064,7 @@ class WordPressPlaywright:
     async def _fill_seo_meta_description(self, page: Page, meta_description: str) -> bool:
         """
         Fill meta description in Yoast SEO metabox.
-        
-        Targets: div#yoast-google-preview-description-metabox (contenteditable)
+        First tries to update the actual input field, then falls back to snippet preview.
         """
         await page.wait_for_timeout(200)
         await self._scroll_to_block_editor_metaboxes(page)
@@ -1010,12 +1072,96 @@ class WordPressPlaywright:
         await self._open_yoast_sidebar_tab_if_present(page)
         await page.wait_for_timeout(600)
 
+        # FIRST: Try to fill the Draft.js contenteditable field directly
+        # Yoast uses Draft.js for the snippet editor, which uses contenteditable divs
+        try:
+            # Direct ID selector for Yoast's meta description Draft.js editor
+            meta_desc_field = page.locator("#yoast-google-preview-description-metabox").first
+            if await meta_desc_field.count() > 0:
+                await self._safe_scroll_into_view(page, meta_desc_field)
+                await page.wait_for_timeout(100)
+                
+                # Click to focus the field
+                await meta_desc_field.click(force=True)
+                await page.wait_for_timeout(200)
+                
+                # Select all content using Ctrl+A keyboard shortcut
+                await page.keyboard.press('Control+A')
+                await page.wait_for_timeout(100)
+                
+                # Delete selected content using Delete key
+                await page.keyboard.press('Delete')
+                await page.wait_for_timeout(200)
+                
+                # Type the new content with slow typing (delay=5ms per char) so Draft.js can process
+                await page.keyboard.type(meta_description, delay=5)
+                await page.wait_for_timeout(300)
+                
+                # Trigger blur event to finalize the change
+                await meta_desc_field.evaluate("el => el.blur()")
+                await page.wait_for_timeout(200)
+                
+                self.logger.add_log(
+                    "✅ Meta description filled (keyboard: Ctrl+A → Delete → Type)",
+                    "success",
+                    f"{len(meta_description)} chars",
+                )
+                return True
+        except Exception as e:
+            self.logger.add_log(f"Keyboard method failed: {str(e)[:50]}", "debug", "")
+            pass
+        
+        # Fallback: Try direct field selectors
+        actual_input_selectors = [
+            "textarea[name='_yoast_wpseo_metadesc']",
+            "input[name='_yoast_wpseo_metadesc']",
+            "textarea#yoast_wpseo_metadesc",
+            "input#yoast_wpseo_metadesc",
+            "textarea[name='rank_math_description']",
+            "input[name='rank_math_description']",
+            "[role='textbox'][aria-label*='description']",
+            "textarea[placeholder*='description' i]",
+            "input[placeholder*='description' i]",
+        ]
+        
+        for selector in actual_input_selectors:
+            try:
+                loc = page.locator(selector).first
+                if await loc.count() > 0:
+                    # Make sure it's visible and not the focus keyphrase field
+                    is_visible = await loc.is_visible()
+                    if not is_visible:
+                        continue
+                    
+                    await self._safe_scroll_into_view(page, loc)
+                    await page.wait_for_timeout(100)
+                    await loc.click(timeout=5000)
+                    await loc.fill(meta_description, timeout=15000, force=True)
+                    
+                    # Trigger change events
+                    await loc.evaluate("""(el) => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }""")
+                    await page.wait_for_timeout(200)
+                    
+                    self.logger.add_log(
+                        "✅ Meta description filled (actual input field)",
+                        "success",
+                        f"{len(meta_description)} chars via {selector}",
+                    )
+                    return True
+            except Exception:
+                continue
+
+        # FALLBACK: Try updating the snippet preview (visual representation)
         try:
             await page.locator("#yoast-google-preview-description-metabox").first.wait_for(
                 state="attached", timeout=15000
             )
             self.logger.add_log("✓ Yoast meta field is present in DOM", "debug", "")
-        except Exception as e:
+        except Exception:
             self.logger.add_log(
                 f"Timeout waiting for Yoast field",
                 "warning",
@@ -1030,7 +1176,7 @@ class WordPressPlaywright:
             if loc is None:
                 return False
             
-            self.logger.add_log("🎯 Found meta description field", "info", "div#yoast-google-preview-description-metabox")
+            self.logger.add_log("🎯 Found meta description preview field", "info", "div#yoast-google-preview-description-metabox")
             
             # Scroll into view
             await self._safe_scroll_into_view(page, loc)
@@ -1041,51 +1187,50 @@ class WordPressPlaywright:
             
             await page.wait_for_timeout(150)
             
-            # For contenteditable DIV: Select all and delete
-            await page.keyboard.press('Control+A')  # Ctrl+A to select all
+            # Try using the React/JS method first
+            if await self._set_contenteditable_text_react(loc, meta_description):
+                self.logger.add_log(
+                    "✅ Meta description filled (snippet preview - React/JS method)",
+                    "success",
+                    f"{len(meta_description)} chars",
+                )
+                await page.wait_for_timeout(300)
+                return True
+            
+            # Fallback: Clear and type manually
+            await page.keyboard.press('Control+A')
             await page.wait_for_timeout(50)
-            await page.keyboard.press('Delete')  # Delete selected content
+            await page.keyboard.press('Delete')
             await page.wait_for_timeout(100)
             
-            # Verify it's empty
             current = await loc.inner_text()
             if current.strip():
-                # If still not empty, use JavaScript to clear completely
                 await loc.evaluate('el => { el.textContent = ""; }')
                 await page.wait_for_timeout(100)
             
-            # Now type the new content - use page.keyboard.type() for better reliability
             await page.keyboard.type(meta_description, delay=1)
             await page.wait_for_timeout(300)
             
-            # Verify the content
+            # Trigger input and change events
+            await loc.evaluate("""(el) => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }""")
+            await page.wait_for_timeout(200)
+            
             final_text = await loc.inner_text()
             
-            if meta_description.strip() == final_text.strip():
+            if meta_description.strip() == final_text.strip() or meta_description in final_text:
                 self.logger.add_log(
-                    "✅ Meta description filled",
-                    "success",
-                    f"{len(final_text)} chars",
-                )
-                return True
-            elif meta_description in final_text:
-                # Content is there, even if there's extra characters
-                self.logger.add_log(
-                    "✅ Meta description filled",
+                    "✅ Meta description filled (snippet preview - keyboard method)",
                     "success",
                     f"{len(final_text)} chars",
                 )
                 return True
             else:
-                if await self._set_contenteditable_text_react(loc, meta_description):
-                    self.logger.add_log(
-                        "✅ Meta description filled (JS fallback)",
-                        "success",
-                        f"{len(meta_description)} chars",
-                    )
-                    return True
                 self.logger.add_log(
-                    "⚠️ Content mismatch",
+                    "⚠️ Content mismatch in snippet preview",
                     "warning",
                     f"Expected {len(meta_description)}, got {len(final_text)}",
                 )
@@ -1093,7 +1238,7 @@ class WordPressPlaywright:
         
         except Exception as e:
             self.logger.add_log(
-                f"Exception: {str(e)[:80]}",
+                f"Exception updating snippet preview: {str(e)[:80]}",
                 "error",
                 ""
             )
@@ -1138,15 +1283,100 @@ class WordPressPlaywright:
         return False
 
     async def _fill_seo_meta_title(self, page: Page, meta_title: str) -> bool:
-        """Fill SEO title in Yoast snippet preview (contenteditable, above meta description)."""
+        """Fill SEO title in Yoast/Rank Math. First tries actual input field, then snippet preview."""
         await page.wait_for_timeout(200)
         await self._scroll_to_block_editor_metaboxes(page)
         await self._ensure_yoast_metabox_open(page)
         await self._open_yoast_sidebar_tab_if_present(page)
         await page.wait_for_timeout(600)
 
-        self.logger.add_log("📦 Locating Yoast SEO title field", "info", "")
+        self.logger.add_log("📦 Locating SEO title field", "info", "")
 
+        # FIRST: Try to fill the Draft.js contenteditable field directly
+        # Yoast uses Draft.js for the snippet editor, which uses contenteditable divs
+        try:
+            # Direct ID selector for Yoast's SEO title Draft.js editor
+            seo_title_field = page.locator("#yoast-google-preview-title-metabox").first
+            if await seo_title_field.count() > 0:
+                await self._safe_scroll_into_view(page, seo_title_field)
+                await page.wait_for_timeout(100)
+                
+                # Click to focus the field
+                await seo_title_field.click(force=True)
+                await page.wait_for_timeout(200)
+                
+                # Select all content using Ctrl+A keyboard shortcut
+                await page.keyboard.press('Control+A')
+                await page.wait_for_timeout(100)
+                
+                # Delete selected content using Delete key
+                await page.keyboard.press('Delete')
+                await page.wait_for_timeout(200)
+                
+                # Type the new content with slow typing (delay=5ms per char) so Draft.js can process
+                await page.keyboard.type(meta_title, delay=5)
+                await page.wait_for_timeout(300)
+                
+                # Trigger blur event to finalize the change
+                await seo_title_field.evaluate("el => el.blur()")
+                await page.wait_for_timeout(200)
+                
+                self.logger.add_log(
+                    "✅ SEO title filled (keyboard: Ctrl+A → Delete → Type)",
+                    "success",
+                    f"{len(meta_title)} chars",
+                )
+                return True
+        except Exception as e:
+            self.logger.add_log(f"Keyboard method failed: {str(e)[:50]}", "debug", "")
+            pass
+        
+        # Fallback: Try direct field selectors
+        actual_input_selectors = [
+            "input[name='_yoast_wpseo_title']",
+            "input#yoast_wpseo_title",
+            "textarea[name='_yoast_wpseo_title']",
+            "textarea#yoast_wpseo_title",
+            "input[name='rank_math_title']",
+            "input#rank_math_title",
+            "textarea[name='rank_math_title']",
+            "[role='textbox'][aria-label*='title' i]",
+            "input[placeholder*='title' i]",
+            "textarea[placeholder*='title' i]",
+        ]
+        
+        for selector in actual_input_selectors:
+            try:
+                loc = page.locator(selector).first
+                if await loc.count() > 0:
+                    # Make sure it's visible and not the focus keyphrase field
+                    is_visible = await loc.is_visible()
+                    if not is_visible:
+                        continue
+                    
+                    await self._safe_scroll_into_view(page, loc)
+                    await page.wait_for_timeout(100)
+                    await loc.click(timeout=5000)
+                    await loc.fill(meta_title, timeout=15000, force=True)
+                    
+                    # Trigger change events
+                    await loc.evaluate("""(el) => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }""")
+                    await page.wait_for_timeout(200)
+                    
+                    self.logger.add_log(
+                        "✅ SEO title filled (actual input field)",
+                        "success",
+                        f"{len(meta_title)} chars via {selector}",
+                    )
+                    return True
+            except Exception:
+                continue
+
+        # FALLBACK: Try updating the snippet preview (visual representation)
         try:
             await page.locator("#yoast-google-preview-title-metabox").first.wait_for(
                 state="attached", timeout=15000
@@ -1162,7 +1392,7 @@ class WordPressPlaywright:
                 return False
 
             self.logger.add_log(
-                "🎯 Found SEO title field",
+                "🎯 Found SEO title preview field",
                 "info",
                 "div#yoast-google-preview-title-metabox",
             )
@@ -1170,6 +1400,18 @@ class WordPressPlaywright:
             await page.wait_for_timeout(250)
             await self._focus_yoast_contenteditable(page, loc)
             await page.wait_for_timeout(150)
+            
+            # Try using the React/JS method first
+            if await self._set_contenteditable_text_react(loc, meta_title):
+                self.logger.add_log(
+                    "✅ SEO title filled (snippet preview - React/JS method)",
+                    "success",
+                    f"{len(meta_title)} chars",
+                )
+                await page.wait_for_timeout(300)
+                return True
+            
+            # Fallback: Clear and type manually
             await page.keyboard.press("Control+A")
             await page.wait_for_timeout(50)
             await page.keyboard.press("Delete")
@@ -1180,29 +1422,31 @@ class WordPressPlaywright:
                 await page.wait_for_timeout(100)
             await page.keyboard.type(meta_title, delay=1)
             await page.wait_for_timeout(300)
+            
+            # Trigger input and change events
+            await loc.evaluate("""(el) => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }""")
+            await page.wait_for_timeout(200)
+            
             final_text = await loc.inner_text()
             if meta_title.strip() == final_text.strip() or meta_title in final_text:
                 self.logger.add_log(
-                    "✅ SEO title filled",
+                    "✅ SEO title filled (snippet preview - keyboard method)",
                     "success",
                     f"{len(final_text)} chars",
                 )
                 return True
-            if await self._set_contenteditable_text_react(loc, meta_title):
-                self.logger.add_log(
-                    "✅ SEO title filled (JS fallback)",
-                    "success",
-                    f"{len(meta_title)} chars",
-                )
-                return True
             self.logger.add_log(
-                "⚠️ SEO title content mismatch",
+                "⚠️ SEO title content mismatch in snippet preview",
                 "warning",
                 f"Expected {len(meta_title)}, got {len(final_text)}",
             )
             return True
         except Exception as e:
-            self.logger.add_log(f"Exception: {str(e)[:80]}", "error", "")
+            self.logger.add_log(f"Exception updating snippet preview: {str(e)[:80]}", "error", "")
             return False
 
     async def _fill_seo_meta_title_fallback(self, page: Page, meta_title: str) -> bool:
@@ -1486,7 +1730,11 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
-            if not await self._fill_seo_meta_description(page, meta_description):
+            filled = await self._fill_seo_meta_description(page, meta_description)
+            if not filled:
+                filled = await self._fill_seo_meta_description_fallback(page, meta_description)
+            
+            if not filled:
                 screenshot_path = (
                     f"{SCREENSHOTS_DIR}/meta_field_not_found_"
                     f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
