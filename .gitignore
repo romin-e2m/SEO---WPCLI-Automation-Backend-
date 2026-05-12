@@ -9,6 +9,11 @@ extra/
 .pytest_cache/
 .DS_Store
 
+# Test files (local / pytest)
+test_*.py
+*_test.py
+test_playwright_system.py
+
 # Graphify (local-only; never commit)
 graphify-out/
 .graphify-cache/
