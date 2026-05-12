@@ -104,6 +104,113 @@ def extract_slug_with_trailing_slash(url: str) -> str:
     return last_slug + "/" if last_slug else ""
 
 
+def _normalize_eps_from_slug(slug: str) -> str:
+    s = (slug or "").strip().lower()
+    if not s:
+        return ""
+    return s if s.endswith("/") else s + "/"
+
+
+def _normalize_from_cell(from_text: str) -> str:
+    """Table may show slug only or a full URL; align with extract_slug_with_trailing_slash."""
+    t = (from_text or "").strip()
+    if not t:
+        return ""
+    if "://" in t or t.startswith("//"):
+        return _normalize_eps_from_slug(extract_slug_with_trailing_slash(t))
+    return _normalize_eps_from_slug(t)
+
+
+def _host_for_compare(netloc: str) -> str:
+    h = (netloc or "").strip().lower()
+    if h.startswith("www."):
+        return h[4:]
+    return h
+
+
+def _url_identity_key(url: str) -> str | None:
+    """Host (without www) + path, lowercased, no trailing slash — compare destinations."""
+    try:
+        raw = (url or "").strip()
+        if not raw:
+            return None
+        p = urlparse(raw)
+        if not p.scheme and raw.startswith("//"):
+            p = urlparse("https:" + raw)
+        netloc = _host_for_compare(p.netloc or "")
+        path = (p.path or "/").rstrip("/").lower()
+        if not netloc and path.startswith("//"):
+            inner = urlparse("https:" + path)
+            netloc = _host_for_compare(inner.netloc or "")
+            path = (inner.path or "/").rstrip("/").lower()
+        if path.startswith("/"):
+            path = path[1:]
+        return f"{netloc}/{path}" if path else netloc or None
+    except Exception:
+        return None
+
+
+def _slugify_label(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+
+def _to_cell_text_matches_url(to_cell_text: str, to_url: str) -> bool:
+    """Match list column text (often post title) to target URL path (no REST)."""
+    label = (to_cell_text or "").strip()
+    if not label:
+        return False
+    slug_seg = extract_slug_with_trailing_slash(to_url).rstrip("/").lower()
+    if len(slug_seg) < 2:
+        return False
+    ls = _slugify_label(slug_seg)
+    lt = _slugify_label(label)
+    if not ls or not lt:
+        return False
+    if ls == lt:
+        return True
+    if len(ls) >= 4 and (ls in lt or lt in ls):
+        return True
+    return False
+
+
+def _eps_row_matches_destination(to_hrefs: list[str], to_text: str, to_url: str) -> bool:
+    want = _url_identity_key(to_url)
+    if want:
+        for h in to_hrefs or []:
+            hk = _url_identity_key(h)
+            if hk and hk == want:
+                return True
+    ulow = (to_url or "").strip().lower()
+    for h in to_hrefs or []:
+        if (h or "").strip().lower() == ulow:
+            return True
+    if _to_cell_text_matches_url(to_text, to_url):
+        return True
+    tnorm = re.sub(r"\s+", " ", (to_text or "").strip().lower())
+    if tnorm and ulow and ulow in tnorm:
+        return True
+    return False
+
+
+def _eps_redirect_is_duplicate(
+    from_slug: str, to_url: str, rows: list[dict[str, Any]]
+) -> bool:
+    nf = _normalize_eps_from_slug(from_slug)
+    if not nf:
+        return False
+    for row in rows:
+        rf = _normalize_from_cell(str(row.get("fromText") or ""))
+        if rf != nf:
+            continue
+        hrefs = row.get("hrefs") or []
+        if not isinstance(hrefs, list):
+            hrefs = []
+        hrefs = [str(h) for h in hrefs if h]
+        if _eps_row_matches_destination(hrefs, str(row.get("toText") or ""), to_url):
+            return True
+    return False
+
+
 def _is_wordpress_editor_save_response(resp) -> bool:
     """Detect block editor save (REST) or classic post.php save."""
     u = resp.url or ""
@@ -474,6 +581,72 @@ class WordPressPlaywright:
                 "save_button": None
             }
 
+    async def _collect_existing_eps_redirect_rows(self, page: Page) -> list[dict[str, Any]]:
+        """
+        Read current redirect rules from the EPS 301 Redirects admin table (DOM only, no API).
+
+        Returns rows with fromText, toText, and hrefs from the Redirect To cell.
+        """
+        try:
+            raw = await page.evaluate(
+                """
+                () => {
+                    const rows = [];
+                    const normHeader = (t) => (t || "").replace(/\\s+/g, " ").trim().toLowerCase();
+                    for (const table of document.querySelectorAll("table")) {
+                        const trs = [...table.querySelectorAll("tr")];
+                        let fromI = -1;
+                        let toI = -1;
+                        let start = -1;
+                        for (let ri = 0; ri < trs.length; ri++) {
+                            const cells = [...trs[ri].querySelectorAll("th, td")];
+                            if (!cells.length) continue;
+                            const texts = cells.map((c) => normHeader(c.innerText));
+                            if (texts.some((t) => t.includes("redirect from")) && texts.some((t) => t.includes("redirect to"))) {
+                                fromI = texts.findIndex((t) => t.includes("redirect from"));
+                                toI = texts.findIndex((t) => t.includes("redirect to"));
+                                start = ri + 1;
+                                break;
+                            }
+                        }
+                        if (start < 0 || fromI < 0 || toI < 0) continue;
+                        for (let ri = start; ri < trs.length; ri++) {
+                            const tds = [...trs[ri].querySelectorAll("td")];
+                            if (tds.length <= Math.max(fromI, toI)) continue;
+                            const firstTxt = normHeader(tds[0].innerText).split(/\\s+/)[0];
+                            if (!/^\\d+$/.test(firstTxt)) continue;
+                            const fromText = (tds[fromI].innerText || "").trim().replace(/\\s+/g, " ");
+                            const toText = (tds[toI].innerText || "").trim().replace(/\\s+/g, " ");
+                            const hrefs = [...tds[toI].querySelectorAll("a[href]")].map((a) => a.href).filter(Boolean);
+                            rows.push({ fromText, toText, hrefs });
+                        }
+                    }
+                    return rows;
+                }
+                """
+            )
+            if not isinstance(raw, list):
+                return []
+            out: list[dict[str, Any]] = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                out.append(
+                    {
+                        "fromText": item.get("fromText") or "",
+                        "toText": item.get("toText") or "",
+                        "hrefs": item.get("hrefs") if isinstance(item.get("hrefs"), list) else [],
+                    }
+                )
+            return out
+        except Exception as e:
+            self.logger.add_log(
+                "⚠️ Could not read existing redirect table (dedupe skipped)",
+                "warning",
+                str(e),
+            )
+            return []
+
     async def create_301_redirect(
         self, 
         from_slug: str, 
@@ -518,7 +691,24 @@ class WordPressPlaywright:
                 "✅ Redirects page loaded",
                 "success"
             )
-            
+
+            existing_rows = await self._collect_existing_eps_redirect_rows(page)
+            if _eps_redirect_is_duplicate(from_slug, to_url, existing_rows):
+                self.logger.add_log(
+                    "⏭️ Duplicate redirect skipped (same From → To already in table)",
+                    "info",
+                    f"{from_slug} → {to_url}",
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "duplicate",
+                    "message": "Identical redirect already exists (Playwright table check).",
+                    "from_slug": from_slug,
+                    "to_url": to_url,
+                    "logs": self.logger.get_logs(),
+                    "screenshots": self.logger.get_screenshots(),
+                }
+
             self.logger.add_log(
                 "🔍 Finding form fields",
                 "info",

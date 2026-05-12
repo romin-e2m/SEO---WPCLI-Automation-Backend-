@@ -10,10 +10,10 @@ from typing import Any
 router = APIRouter(prefix="/api/qa", tags=["qa"])
 
 # qa_agent/ is copied to /qa_agent inside the container (see Dockerfile).
-# On the host (local dev without Docker) it lives one level above the backend/ dir.
+# On the host (local dev without Docker) it lives in backend/qa_agent.
 _QA_AGENT_CANDIDATES = [
     Path("/qa_agent"),                                      # inside Docker container
-    Path(__file__).parent.parent.parent.parent / "qa_agent",  # host: project_root/qa_agent
+    Path(__file__).parent.parent.parent / "qa_agent",  # host: backend/qa_agent
 ]
 for _p in _QA_AGENT_CANDIDATES:
     if _p.exists() and str(_p) not in sys.path:

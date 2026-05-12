@@ -1378,16 +1378,31 @@ async def _exec_redirects_301_playwright(
                         playwright_logs=logs,
                     ),
                 )
-            else:
-                logger.error(f"Playwright redirect creation failed: {result.get('error')}")
+            if result.get("status") == "skipped":
+                msg = result.get("message") or "Identical redirect already exists (Playwright table check)."
+                logger.info(f"301 redirect skipped (duplicate): {from_slug} → {to_url}")
                 return ExecuteRowResult(
                     action_type="redirects_301",
                     sheet_name=row.sheet_name,
                     row_index=row.row_index,
-                    outcome="failed",
-                    message=result.get("error", "Unknown error"),
-                    detail=_detail(**base_detail, playwright_logs=logs),
+                    outcome="skipped",
+                    message=msg,
+                    detail=_detail(
+                        **base_detail,
+                        plugin="Playwright (admin UI)",
+                        playwright_logs=logs,
+                        skip_reason=result.get("reason"),
+                    ),
                 )
+            logger.error(f"Playwright redirect creation failed: {result.get('error')}")
+            return ExecuteRowResult(
+                action_type="redirects_301",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message=result.get("error", "Unknown error"),
+                detail=_detail(**base_detail, playwright_logs=logs),
+            )
 
     except Exception as e:
         logger.error(f"Playwright execution failed: {e}")
