@@ -153,14 +153,21 @@ def _is_probably_xls(content: bytes) -> bool:
 
 
 def _all_sheet_row_counts_xlsx(content: bytes) -> dict[str, int]:
+    """Count *data* rows (excluding the header row) per sheet.
+
+    openpyxl's read_only mode does not always compute max_row reliably,
+    so we open in normal mode (workbooks are size-capped upstream).
+    """
     bio = io.BytesIO(content)
-    wb = load_workbook(bio, read_only=True, data_only=True)
+    wb = load_workbook(bio, read_only=False, data_only=True)
     try:
         counts: dict[str, int] = {}
         for name in wb.sheetnames:
             ws = wb[name]
             mr = ws.max_row
-            counts[name] = int(mr) if mr is not None else 0
+            total = int(mr) if mr is not None else 0
+            # Subtract the header row to align with the analyzed dataframe shape.
+            counts[name] = max(0, total - 1)
         return counts
     finally:
         wb.close()
@@ -425,3 +432,160 @@ def analyze_xlsx_bytes(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Backward-compatible entry for tests; prefer analyze_spreadsheet_bytes."""
     return _analyze_xlsx_bytes(content, preview_rows=preview_rows)
+
+
+_DEFAULT_MAX_FULL_ROWS = 100_000
+
+
+def _max_full_rows() -> int:
+    raw = os.getenv("MAX_WORKBOOK_FULL_ROWS", str(_DEFAULT_MAX_FULL_ROWS))
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return _DEFAULT_MAX_FULL_ROWS
+
+
+def _read_full_xlsx_sheets(
+    content: bytes,
+    sheet_names: list[str] | None,
+) -> dict[str, dict[str, Any]]:
+    if not _is_probably_xlsx(content):
+        raise ValueError("File is not a valid .xlsx (Office Open XML) workbook.")
+
+    bio = io.BytesIO(content)
+    xl = pd.ExcelFile(bio, engine="openpyxl")
+    try:
+        all_names = list(xl.sheet_names)
+        targets = [n for n in (sheet_names or all_names) if n in all_names]
+        max_rows = _max_full_rows()
+        out: dict[str, dict[str, Any]] = {}
+        for name in targets:
+            df = pd.read_excel(
+                xl,
+                sheet_name=name,
+                header=0,
+                dtype=object,
+                nrows=max_rows,
+            )
+            df = df.rename(columns={c: _stringify_column(c) for c in df.columns})
+            columns = [str(c) for c in df.columns.tolist()]
+            rows: list[dict[str, Any]] = []
+            for _, row in df.iterrows():
+                rec: dict[str, Any] = {}
+                for col in columns:
+                    rec[col] = _json_safe_value(row.get(col))
+                rows.append(rec)
+            out[name] = {"columns": columns, "rows": rows}
+        return out
+    finally:
+        xl.close()
+
+
+def _read_full_xls_sheets(
+    content: bytes,
+    sheet_names: list[str] | None,
+) -> dict[str, dict[str, Any]]:
+    if not _is_probably_xls(content):
+        raise ValueError("File is not a valid .xls (Excel 97-2003) workbook.")
+
+    book = xlrd.open_workbook(file_contents=content)
+    all_names = list(book.sheet_names())
+    targets = [n for n in (sheet_names or all_names) if n in all_names]
+    max_rows = _max_full_rows()
+
+    out: dict[str, dict[str, Any]] = {}
+    for name in targets:
+        sh = book.sheet_by_name(name)
+        nrows = int(sh.nrows)
+        ncol = int(sh.ncols)
+        if nrows == 0 or ncol == 0:
+            out[name] = {"columns": [], "rows": []}
+            continue
+
+        raw_headers = [sh.cell_value(0, c) for c in range(ncol)]
+        columns = _xls_unique_columns(raw_headers)
+
+        upper = min(nrows - 1, max_rows)
+        rows_out: list[dict[str, Any]] = []
+        for r in range(1, 1 + upper):
+            rec: dict[str, Any] = {}
+            for c, col in enumerate(columns):
+                if c >= ncol:
+                    rec[col] = None
+                    continue
+                cell = sh.cell(r, c)
+                rec[col] = _json_safe_value(_xls_cell_to_python(cell, book))
+            rows_out.append(rec)
+
+        out[name] = {"columns": columns, "rows": rows_out}
+    return out
+
+
+def _read_full_csv_sheets(
+    content: bytes,
+    sheet_name: str,
+) -> dict[str, dict[str, Any]]:
+    if not content.strip():
+        raise ValueError("CSV file is empty.")
+
+    last_err: Exception | None = None
+    chosen_enc: str | None = None
+    df: pd.DataFrame | None = None
+    max_rows = _max_full_rows()
+
+    for enc in _CSV_ENCODINGS_TRY:
+        try:
+            bio = io.BytesIO(content)
+            df = pd.read_csv(
+                bio,
+                encoding=enc,
+                dtype=object,
+                nrows=max_rows,
+                on_bad_lines="skip",
+            )
+            chosen_enc = enc
+            break
+        except Exception as e:
+            last_err = e
+
+    if df is None or chosen_enc is None:
+        msg = "Could not decode CSV (tried UTF-8 with BOM, UTF-8, Windows-1252, Latin-1)."
+        if last_err:
+            raise ValueError(msg) from last_err
+        raise ValueError(msg)
+
+    df = df.rename(columns={c: _stringify_column(c) for c in df.columns})
+    columns = [str(c) for c in df.columns.tolist()]
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        rec: dict[str, Any] = {}
+        for col in columns:
+            rec[col] = _json_safe_value(row.get(col))
+        rows.append(rec)
+
+    return {sheet_name: {"columns": columns, "rows": rows}}
+
+
+def read_full_sheets(
+    content: bytes,
+    filename: str,
+    sheet_names: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return {sheet_name: {columns: [...], rows: [{...}, ...]}} for the requested sheets.
+
+    Used by the mapping validate/normalize endpoints to evaluate the user's column choices
+    against actual data, not just the preview.
+    """
+    if not content:
+        raise ValueError("Empty file.")
+
+    suffix = PurePath(filename).suffix.lower()
+    if suffix == ".csv":
+        label = PurePath(filename).stem.strip() or "CSV"
+        return _read_full_csv_sheets(content, label)
+    if suffix == ".xls":
+        return _read_full_xls_sheets(content, sheet_names)
+    if suffix == ".xlsx":
+        return _read_full_xlsx_sheets(content, sheet_names)
+
+    raise ValueError(f"Unsupported file type {suffix or '(none)'}. Use .xlsx, .xls, or .csv.")
