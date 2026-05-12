@@ -12,9 +12,12 @@ from app.schemas.workbook import (
     SheetMappingError,
     SheetSummary,
 )
-
-
-_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+from app.services.mapping_common import (
+    coerce_str as _coerce_str,
+    looks_like_url as _looks_like_url,
+    resolve_source_value as _resolve_mapped_cell,
+    validate_row_fields,
+)
 
 
 # canonical_field -> {required: bool, type: 'url'|'text'|'int'}
@@ -89,21 +92,36 @@ ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
 # canonical_field -> list of header aliases (lower-cased, normalized).
 HEADER_ALIASES: dict[str, list[str]] = {
     "page_url": ["page url", "url", "address", "page", "page address", "landing page"],
-    "current_h1": ["h1", "current h1"],
-    "recommended_h1": ["recommended h1", "new h1", "proposed h1", "h1 (new)"],
+    "current_h1": [
+        "current h1",
+        "h1",
+        "current heading",
+        "heading",
+    ],
+    "recommended_h1": [
+        "recommended h1",
+        "new h1",
+        "proposed h1",
+        "h1 (new)",
+        "recommended heading",
+        "new heading",
+        "proposed heading",
+    ],
     "current_meta_description": [
-        "meta description",
         "current meta description",
-        "description",
+        "meta description",
         "current description",
+        "description",
     ],
     "recommended_meta_description": [
         "recommended meta description",
         "new meta description",
         "proposed meta description",
-        "new meta",
         "meta description (new)",
-        "meta (new)",
+        "recommended description",
+        "new description",
+        "proposed description",
+        "description (new)",
     ],
     "current_meta_title": [
         "meta title",
@@ -189,9 +207,21 @@ def guess_column_map(action_type: ActionType, columns: list[str]) -> dict[str, s
         if n and n not in norm_to_original:
             norm_to_original[n] = c
     out: dict[str, str] = {}
+    
+    # Define fields that should not cross-contaminate
+    # e.g., H1 fields should never match description columns
+    exclusions: dict[str, set[str]] = {
+        "current_meta_description": {"h1", "heading", "title"},
+        "recommended_meta_description": {"h1", "heading", "title"},
+        "current_h1": {"description", "meta", "description"},
+        "recommended_h1": {"description", "meta"},
+    }
+    
     for f in spec["fields"]:
         key: str = f["key"]
         aliases = HEADER_ALIASES.get(key, [])
+        exclude_keywords = exclusions.get(key, set())
+        
         # exact alias match first
         for a in aliases:
             if a in norm_to_original:
@@ -202,9 +232,12 @@ def guess_column_map(action_type: ActionType, columns: list[str]) -> dict[str, s
         # contains-match fallback: header that contains the alias as a whole word
         for a in aliases:
             for n, original in norm_to_original.items():
+                # Check if column matches the alias
                 if re.search(rf"(^|\W){re.escape(a)}($|\W)", n):
-                    out[key] = original
-                    break
+                    # Check if it contains excluded keywords
+                    if not any(excl in n for excl in exclude_keywords):
+                        out[key] = original
+                        break
             if key in out:
                 break
     return out
@@ -220,14 +253,15 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
         if "image" in n or "alt" in n:
             name_hits["images"] = name_hits.get("images", 0) + 5
         if "meta" in n and "description" in n:
-            name_hits["meta"] = name_hits.get("meta", 0) + 5
-        elif n == "meta":
-            name_hits["meta"] = name_hits.get("meta", 0) + 5
+            name_hits["meta"] = name_hits.get("meta", 0) + 20  # Very high priority for explicit "meta description"
+        elif n == "meta" or "meta_desc" in n:
+            name_hits["meta"] = name_hits.get("meta", 0) + 15  # High priority for just "meta" sheet
         if "meta" in n and "title" in n and "description" not in n:
-            name_hits["meta_title"] = name_hits.get("meta_title", 0) + 5
+            name_hits["meta_title"] = name_hits.get("meta_title", 0) + 15  # High priority for "meta title"
         if "url" in n and ("cleanup" in n or "clean" in n or "replace" in n):
             name_hits["url_cleanup"] = name_hits.get("url_cleanup", 0) + 5
-        if "on_page" in n.replace(" ", "_") or "on page" in n or "title" in n or "h1" in n:
+        # Only match on_page if sheet name is NOT about meta or title
+        if ("on_page" in n.replace(" ", "_") or "on page" in n or "h1" in n) and "meta" not in n:
             name_hits["on_page"] = name_hits.get("on_page", 0) + 4
 
     # Score each action by how many of its required fields are matchable.
@@ -242,11 +276,17 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
     best: ActionType | None = None
     best_score = -1
     for action in ACTION_FIELDS.keys():
-        score = col_hits.get(action, 0) * 2 + name_hits.get(action, 0)
+        # If sheet name strongly suggests an action, weight name detection heavily
+        name_score = name_hits.get(action, 0)
+        col_score = col_hits.get(action, 0)
+        # Name detection gets 3x weight over column detection for explicit matches
+        score = col_score * 2 + name_score * 3
+        
         # require at least all required mapped to be a confident pick
         spec = ACTION_FIELDS[action]
         required_keys = [f["key"] for f in spec["fields"] if f["required"]]
-        if col_hits.get(action, 0) < len(required_keys):
+        if col_score < len(required_keys) and name_score < 10:
+            # Only penalize if both name AND column detection are weak
             score = score - 10
         if score > best_score:
             best_score = score
@@ -254,25 +294,6 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
     if best is None or best_score < 0:
         return None
     return best
-
-
-def _coerce_str(v: Any) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, float):
-        # avoid "nan"
-        try:
-            import math
-
-            if math.isnan(v) or math.isinf(v):
-                return ""
-        except Exception:
-            pass
-    return str(v).strip()
-
-
-def _looks_like_url(v: str) -> bool:
-    return bool(_URL_RE.match(v))
 
 
 def _validate_static(mapping: SheetMapping, available_columns: list[str]) -> list[str]:
@@ -311,16 +332,8 @@ def _resolve_source_value(
     row: dict[str, Any],
     available_columns: list[str],
 ) -> Any:
-    if not source_col:
-        return None
-    if source_col in row:
-        return row.get(source_col)
-    # case-insensitive fallback
-    target = _norm_header(source_col)
-    for c in available_columns:
-        if _norm_header(c) == target:
-            return row.get(c)
-    return None
+    _ = canonical_field
+    return _resolve_mapped_cell(source_col, row, available_columns, _norm_header)
 
 
 def _validate_row(
@@ -329,31 +342,8 @@ def _validate_row(
 ) -> tuple[bool, list[str]]:
     """Return (is_valid, skip_reasons). is_valid means it should be included in normalized output."""
     spec = ACTION_FIELDS[mapping.action_type]
-    reasons: list[str] = []
-
-    # row is "empty" if all mapped fields are blank: skip silently.
-    has_any_value = any(_coerce_str(v) for v in row_values.values())
-    if not has_any_value:
-        return False, ["empty_row"]
-
-    for f in spec["fields"]:
-        key: str = f["key"]
-        required: bool = bool(f["required"])
-        ftype: str = f["type"]
-        v = _coerce_str(row_values.get(key))
-        if not v:
-            if required:
-                reasons.append(f"missing:{key}")
-            continue
-        if ftype == "url" and not _looks_like_url(v):
-            reasons.append(f"invalid_url:{key}")
-
-    # any_of groups
-    for group in spec.get("any_of_groups", []):
-        if group and not any(_coerce_str(row_values.get(k)) for k in group):
-            reasons.append(f"missing_any_of:{'|'.join(group)}")
-
-    return (len(reasons) == 0), reasons
+    fields = [(str(f["key"]), bool(f["required"]), str(f["type"])) for f in spec["fields"]]
+    return validate_row_fields(row_values, fields, spec.get("any_of_groups", []))
 
 
 def validate_mapping(

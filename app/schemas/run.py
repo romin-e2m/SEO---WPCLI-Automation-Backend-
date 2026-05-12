@@ -64,6 +64,10 @@ class ExecuteResponse(BaseModel):
     skipped: int
     failed: int
     rows: list[ExecuteRowResult] = Field(default_factory=list)
+    execution_id: str | None = Field(
+        default=None,
+        description="Populated for /api/run/execute: use with GET /api/run/status and /api/run/stream.",
+    )
 
 
 class ExecuteRequest(RunGroupedPayload):

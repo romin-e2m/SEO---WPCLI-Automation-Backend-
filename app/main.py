@@ -11,6 +11,7 @@ from app.api.wp import router as wp_router
 from app.api.schema import router as schema_router
 from app.api.rest_api import router as rest_api_router
 from app.api.system import router as system_router
+from app.api.qa import router as qa_router
 from app.services.schema_manager import SchemaManager
 from app.logging_config import LOGGING_CONFIG
 
@@ -21,11 +22,13 @@ logging.config.dictConfig(LOGGING_CONFIG)
 
 
 def _allowed_origins() -> list[str]:
-    raw = os.getenv(
-        "CORS_ALLOWED_ORIGINS",
-        "http://localhost:3013,http://127.0.0.1:3013,http://0.0.0.0:3013,"
-        "http://localhost:5173,http://127.0.0.1:5173,http://0.0.0.0:5173",
-    )
+    raw = os.getenv("CORS_ALLOWED_ORIGINS")
+    if not raw:
+        raise RuntimeError(
+            "CORS_ALLOWED_ORIGINS environment variable is required. "
+            "Provide a comma-separated list of allowed origins, e.g.: "
+            "http://localhost:3013,http://localhost:5173"
+        )
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     if "*" in origins:
         raise RuntimeError(
@@ -40,7 +43,6 @@ app = FastAPI(title="WP SEO Automation API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
-    allow_origin_regex=os.getenv("CORS_ALLOWED_ORIGIN_REGEX", r"^http://(localhost|127\.0\.0\.1|0\.0\.0\.0):(3013|5173)$"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,6 +57,7 @@ app.include_router(run_router)
 app.include_router(schema_router)
 app.include_router(rest_api_router)
 app.include_router(system_router)
+app.include_router(qa_router)
 
 
 @app.get("/health")

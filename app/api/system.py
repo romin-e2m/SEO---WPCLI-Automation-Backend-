@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import socket
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -50,7 +51,7 @@ def _get_environment_details():
 
         # Get hostname
         try:
-            hostname = os.popen("hostname").read().strip()
+            hostname = socket.gethostname()
             details.append(f"Container ID: {hostname[:12]}...")
         except Exception:
             pass
@@ -120,7 +121,7 @@ def get_system_status():
         "environment": env,
         "details": details,
         "docker": env == "docker",
-        "timestamp": os.popen("date -u +%Y-%m-%dT%H:%M:%SZ").read().strip(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -188,21 +189,3 @@ def add_execution_log(execution_id: str, log_entry: dict):
     if execution_id not in _execution_logs_store:
         _execution_logs_store[execution_id] = []
     _execution_logs_store[execution_id].append(log_entry)
-
-
-@router.post("/test/log")
-def test_add_log(execution_id: str = "default", action: str = "test_action"):
-    """Test endpoint to add a log entry."""
-    import uuid
-    from datetime import datetime
-    
-    log_entry = {
-        "id": f"log_{uuid.uuid4().hex[:8]}",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "action": action,
-        "status": "success",
-        "details": f"Test log entry - {action}",
-    }
-    add_execution_log(execution_id, log_entry)
-    return {"status": "ok", "log_id": log_entry["id"], "execution_id": execution_id}
-

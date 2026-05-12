@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,8 @@ from app.schemas.schema import (
     CreateActionSchemaRequest,
     UpdateActionSchemaRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SchemaManager:
@@ -134,10 +138,10 @@ class SchemaManager:
                 try:
                     schema = ActionSchema(**schema_data)
                     self._schemas[schema.id] = schema
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.warning(f"Failed to load schema {schema_data.get('id', 'unknown')}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load schemas from file {self.storage_path}: {e}")
 
     def _save_to_file(self) -> None:
         """Persist user-defined schemas to JSON file."""
@@ -225,10 +229,18 @@ class SchemaManager:
             
             # Check sheet name keywords
             schema_keywords = schema.id.lower().split("_")
+            # Convert sheet name to words (split by _ and space)
+            sheet_words = set(sheet_lower.replace("_", " ").split())
+            matched_keywords = 0
             for kw in schema_keywords:
-                if kw in sheet_lower:
+                if kw in sheet_words:
+                    matched_keywords += 1
                     score += 0.3
                     matches.append(f"Sheet name contains '{kw}'")
+            # Bonus for multi-word matches (e.g., "meta" + "description" for "meta" schema)
+            if matched_keywords > 1:
+                score += 0.2 * matched_keywords
+                matches.append(f"Matched {matched_keywords} keywords from schema name")
             
             # Check for required fields
             # Be defensive: older / malformed schema payloads might have `fields`
@@ -249,7 +261,15 @@ class SchemaManager:
                     if getattr(f, "required", False) and isinstance(getattr(f, "key", None), str):
                         required_fields.append(f.key)
             if required_fields:
-                matched_required = sum(1 for key in required_fields if key.lower() in cols_lower)
+                matched_required = 0
+                for key in required_fields:
+                    key_normalized = key.lower().replace("_", " ")
+                    # Check exact match or if column contains the field name
+                    for col in cols_lower:
+                        col_normalized = col.replace("_", " ")
+                        if key_normalized in col_normalized or col_normalized in key_normalized:
+                            matched_required += 1
+                            break
                 req_ratio = matched_required / len(required_fields)
                 score += req_ratio * 0.5
                 if matched_required > 0:
@@ -266,8 +286,15 @@ class SchemaManager:
                     key = getattr(f, "key", None)
                     if isinstance(key, str):
                         all_keys.add(key.lower())
-            matched_any = len(all_keys & cols_lower)
             if len(all_keys) > 0:
+                matched_any = 0
+                for key in all_keys:
+                    key_normalized = key.replace("_", " ")
+                    for col in cols_lower:
+                        col_normalized = col.replace("_", " ")
+                        if key_normalized in col_normalized or col_normalized in key_normalized:
+                            matched_any += 1
+                            break
                 any_ratio = matched_any / len(all_keys)
                 score += any_ratio * 0.2
                 if matched_any > 0:
