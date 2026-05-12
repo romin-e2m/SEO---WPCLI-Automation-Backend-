@@ -11,6 +11,7 @@ from app.api.wp import router as wp_router
 from app.api.schema import router as schema_router
 from app.api.rest_api import router as rest_api_router
 from app.api.system import router as system_router
+from app.api.qa import router as qa_router
 from app.services.schema_manager import SchemaManager
 from app.logging_config import LOGGING_CONFIG
 
@@ -56,6 +57,7 @@ app.include_router(run_router)
 app.include_router(schema_router)
 app.include_router(rest_api_router)
 app.include_router(system_router)
+app.include_router(qa_router)
 
 
 @app.get("/health")

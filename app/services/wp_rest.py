@@ -472,7 +472,209 @@ class WpRestClient:
                 logger.warning(f"Update post {post_id} returned unexpected response: {result}")
             
             return result
-    
+
+    # ------------------------------------------------------------------ #
+    # Site settings (Settings → Reading) + homepage helpers              #
+    # ------------------------------------------------------------------ #
+
+    def get_settings(self) -> dict[str, Any]:
+        """Fetch WordPress site settings (``/wp/v2/settings``).
+
+        Requires the authenticated user to have ``manage_options``.
+        """
+        with self._client() as c:
+            r = c.get("/settings")
+            r.raise_for_status()
+            return r.json()
+
+    def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Patch WordPress site settings (``/wp/v2/settings``).
+
+        WordPress accepts POST for partial updates on the settings endpoint.
+        Requires ``manage_options`` for the authenticated user.
+        """
+        with self._client() as c:
+            r = c.post("/settings", json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    def create_page(
+        self,
+        *,
+        title: str,
+        content: str = "",
+        status: str = "publish",
+    ) -> dict[str, Any]:
+        """Create a new Page (``/wp/v2/pages``).
+
+        Requires ``publish_pages`` (or ``edit_pages`` + lower status). Returns the
+        full page object as WordPress sees it.
+        """
+        payload: dict[str, Any] = {
+            "title": title,
+            "content": content,
+            "status": status,
+        }
+        with self._client() as c:
+            r = c.post("/pages", json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    _HOMEPAGE_TITLE_CANDIDATES: tuple[str, ...] = ("home", "homepage", "front page", "front")
+    _HOMEPAGE_SLUG_CANDIDATES: frozenset[str] = frozenset(
+        {"home", "homepage", "front-page", "front", "index"}
+    )
+
+    def _find_homepage_candidate(
+        self,
+        preferred_title: str | None,
+    ) -> dict[str, Any] | None:
+        """Look for an existing Page that already looks like the homepage.
+
+        Order:
+          1. Page whose title exactly equals ``preferred_title`` (case/space-insensitive).
+          2. Page whose title or slug matches a common homepage name
+             (e.g. "Home", "Homepage", slug ``home`` / ``front-page``).
+        Returns ``None`` if nothing reasonable is found.
+        """
+        norm = lambda s: re.sub(r"\s+", " ", (s or "").strip().lower())  # noqa: E731
+
+        with self._client() as c:
+            if preferred_title:
+                try:
+                    r = c.get(
+                        "/pages",
+                        params={
+                            "search": preferred_title,
+                            "per_page": 10,
+                            "context": "view",
+                        },
+                    )
+                    if r.status_code < 400:
+                        items = r.json()
+                        target = norm(preferred_title)
+                        if isinstance(items, list):
+                            for it in items:
+                                rendered = (it.get("title") or {}).get("rendered", "")
+                                if norm(_html_plain_text(rendered)) == target:
+                                    return it
+                except Exception as e:
+                    logger.debug(f"homepage candidate search (title) failed: {e}")
+
+            for q in self._HOMEPAGE_TITLE_CANDIDATES:
+                try:
+                    r = c.get(
+                        "/pages",
+                        params={"search": q, "per_page": 10, "context": "view"},
+                    )
+                    if r.status_code >= 400:
+                        continue
+                    items = r.json()
+                    if not isinstance(items, list):
+                        continue
+                    for it in items:
+                        rendered = (it.get("title") or {}).get("rendered", "")
+                        title_norm = norm(_html_plain_text(rendered))
+                        slug = (it.get("slug") or "").lower()
+                        if title_norm in {c.lower() for c in self._HOMEPAGE_TITLE_CANDIDATES}:
+                            return it
+                        if slug in self._HOMEPAGE_SLUG_CANDIDATES:
+                            return it
+                except Exception as e:
+                    logger.debug(f"homepage candidate search ({q!r}) failed: {e}")
+                    continue
+        return None
+
+    def ensure_static_homepage(
+        self,
+        *,
+        preferred_title: str,
+        preferred_content: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        """Guarantee a static front page exists and is wired into WP settings.
+
+        Behaviour:
+          1. If ``show_on_front == 'page'`` with a valid ``page_on_front``, return the
+             existing page unchanged.
+          2. Else look for an existing candidate page (title match, then "Home" /
+             "Homepage" / slug ``home``). If found, promote it via
+             ``Settings → Reading``.
+          3. Else create a fresh Page (``preferred_title`` / ``preferred_content``)
+             and promote it.
+
+        Returns ``(page_object, action)`` where ``action`` is one of
+        ``"found_existing"``, ``"promoted_existing"``, or ``"created_new"``.
+
+        Raises ``RuntimeError`` (or the underlying ``httpx`` error) if the REST
+        user lacks ``manage_options`` / ``edit_pages`` / ``publish_pages``.
+        """
+        try:
+            settings = self.get_settings()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                raise RuntimeError(
+                    "WP REST user lacks permission to read Settings → Reading "
+                    "(need manage_options). Cannot auto-configure homepage."
+                ) from e
+            raise
+
+        show_on_front = (settings or {}).get("show_on_front") or "posts"
+        page_on_front = (settings or {}).get("page_on_front")
+
+        if show_on_front == "page" and isinstance(page_on_front, int) and page_on_front > 0:
+            try:
+                with self._client() as c:
+                    r = c.get(f"/pages/{page_on_front}", params={"context": "edit"})
+                    if r.status_code == 200:
+                        return r.json(), "found_existing"
+            except Exception as e:
+                logger.debug(f"page_on_front fetch failed: {e}")
+
+        candidate = self._find_homepage_candidate(preferred_title)
+        action: str
+        if candidate is None:
+            try:
+                candidate = self.create_page(
+                    title=preferred_title,
+                    content=preferred_content,
+                    status="publish",
+                )
+                action = "created_new"
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (401, 403):
+                    raise RuntimeError(
+                        "WP REST user lacks permission to create pages "
+                        "(need edit_pages + publish_pages). Cannot auto-configure homepage."
+                    ) from e
+                raise
+        else:
+            action = "promoted_existing"
+
+        page_id = candidate.get("id") if isinstance(candidate, dict) else None
+        if not isinstance(page_id, int) or page_id <= 0:
+            raise RuntimeError("Homepage candidate has no usable id.")
+
+        try:
+            self.update_settings({"show_on_front": "page", "page_on_front": page_id})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                raise RuntimeError(
+                    "WP REST user lacks permission to update Settings → Reading "
+                    "(need manage_options). Cannot wire homepage."
+                ) from e
+            raise
+
+        # Re-fetch with context=edit so the caller gets ``title.raw`` and ``content.raw``.
+        try:
+            with self._client() as c:
+                r = c.get(f"/pages/{page_id}", params={"context": "edit"})
+                if r.status_code == 200:
+                    candidate = r.json()
+        except Exception as e:
+            logger.debug(f"final page refetch failed (will use prior payload): {e}")
+
+        return candidate, action
+
     def update_seo_meta_description(
         self,
         post_id: int,
@@ -764,15 +966,80 @@ class WpRestClient:
             )
             return post_obj
 
+    def _is_site_root(self, url: str) -> bool:
+        """Return True when ``url`` points at the site root (e.g. ``http://site/`` or just ``http://site``)."""
+        try:
+            parsed = urlsplit(url)
+        except Exception:
+            return False
+        if not parsed.netloc:
+            return False
+        path = (parsed.path or "").strip()
+        return path in {"", "/"}
+
+    def _resolve_homepage(
+        self,
+        client: httpx.Client,
+        *,
+        post_type: Literal["any", "post", "page"],
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Resolve the site root URL via WP ``Settings → Reading``.
+
+        Returns the static front page if one is configured; otherwise signals that the
+        homepage is a dynamic blog index that has no single post/page to update.
+        """
+        try:
+            r = client.get("/settings")
+        except Exception as e:
+            logger.debug(f"GET /settings failed: {type(e).__name__}: {e}")
+            return None, "homepage_settings_unreachable"
+
+        if r.status_code == 401 or r.status_code == 403:
+            return None, "homepage_settings_forbidden"
+        if r.status_code >= 400:
+            return None, "homepage_settings_error"
+
+        try:
+            settings = r.json()
+        except Exception:
+            return None, "homepage_settings_invalid_json"
+
+        show_on_front = (settings or {}).get("show_on_front") or "posts"
+        if show_on_front != "page":
+            return None, "homepage_is_blog_index"
+
+        page_on_front = (settings or {}).get("page_on_front")
+        if not isinstance(page_on_front, int) or page_on_front <= 0:
+            return None, "homepage_static_page_not_configured"
+
+        if post_type == "post":
+            return None, "homepage_resolved_to_page_but_post_required"
+
+        try:
+            obj = client.get(f"/pages/{page_on_front}", params={"context": "view"})
+            if obj.status_code == 200:
+                return obj.json(), "rest_homepage_static_page"
+        except Exception as e:
+            logger.debug(f"GET /pages/{page_on_front} failed: {type(e).__name__}: {e}")
+
+        return None, "homepage_static_page_fetch_failed"
+
     def resolve_post_by_url(
         self, url: str, *, post_type: Literal["any", "post", "page"] = "any"
     ) -> tuple[dict[str, Any] | None, str]:
-        """
-        Best-effort REST-only resolver.
-        Tries multiple strategies:
-        1. Exact match on returned `link`
-        2. Prefix match on `link`
-        3. URL contains post/page ID in query params or slug
+        """Resolve a public URL to a single WP post or page via the REST API.
+
+        Resolution order (no loose prefix matching — see notes below):
+        1. Site root ``/``: read ``/wp/v2/settings``. If ``show_on_front=page`` and
+           ``page_on_front`` is set, return that page. Otherwise return a structured
+           ``homepage_*`` reason so callers can present an actionable message.
+        2. Exact match on ``link`` returned by ``GET /posts?search=`` and ``/pages?search=``.
+        3. Extract ``?p=`` / ``?post_id=`` / ``?page_id=`` from the query string and
+           GET that id directly.
+        4. Slug match using the last non-empty URL path segment.
+
+        Loose ``startswith`` "prefix match" was previously used as a fallback and caused
+        the site root to resolve to whichever post WP returned first — drop it entirely.
         """
         normalized = (url or "").strip()
         if not normalized:
@@ -786,40 +1053,42 @@ class WpRestClient:
         else:
             endpoints = ["/posts", "/pages"]
 
-        # Try direct slug/URL matching
         with self._client() as c:
-            for ep in endpoints:
-                # Strategy 1: Search by URL
-                r = c.get(ep, params={"search": normalized, "per_page": 100, "context": "view"})
-                if r.status_code < 400:
-                    items = r.json()
-                    if isinstance(items, list):
-                        # Exact match
-                        for it in items:
-                            link = it.get("link")
-                            if isinstance(link, str) and link.rstrip("/") == normalized.rstrip("/"):
-                                return it, f"rest_search_exact:{ep}"
-                        # Prefix match
-                        for it in items:
-                            link = it.get("link")
-                            if isinstance(link, str) and link.rstrip("/").startswith(normalized.rstrip("/")):
-                                return it, f"rest_search_prefix:{ep}"
+            if self._is_site_root(normalized):
+                return self._resolve_homepage(c, post_type=post_type)
 
-                # Strategy 2: Try to extract ID from URL if it's p=XXX or post=XXX
-                import re
-                from urllib.parse import urlparse, parse_qs
+            from urllib.parse import urlparse, parse_qs
+
+            for ep in endpoints:
+                # Strategy 1: exact `link` match via search
+                try:
+                    r = c.get(ep, params={"search": normalized, "per_page": 100, "context": "view"})
+                    if r.status_code < 400:
+                        items = r.json()
+                        if isinstance(items, list):
+                            target = normalized.rstrip("/")
+                            for it in items:
+                                link = it.get("link")
+                                if isinstance(link, str) and link.rstrip("/") == target:
+                                    return it, f"rest_search_exact:{ep}"
+                except Exception as e:
+                    logger.debug(f"search on {ep} failed: {type(e).__name__}: {e}")
+
+                # Strategy 2: ?p= / ?post_id= / ?page_id= in the URL
                 try:
                     parsed = urlparse(normalized)
                     query_params = parse_qs(parsed.query)
-                    post_id = None
-                    if "p" in query_params:
-                        post_id = int(query_params["p"][0])
-                    elif "post_id" in query_params:
-                        post_id = int(query_params["post_id"][0])
-                    
-                    if post_id:
+                    post_id_candidate: int | None = None
+                    for key in ("p", "post_id", "page_id"):
+                        if key in query_params:
+                            try:
+                                post_id_candidate = int(query_params[key][0])
+                                break
+                            except (TypeError, ValueError):
+                                continue
+                    if post_id_candidate:
                         try:
-                            obj = c.get(f"{ep}/{post_id}", params={"context": "view"})
+                            obj = c.get(f"{ep}/{post_id_candidate}", params={"context": "view"})
                             if obj.status_code == 200:
                                 return obj.json(), f"rest_url_param_id:{ep}"
                         except Exception:
@@ -827,7 +1096,7 @@ class WpRestClient:
                 except Exception:
                     pass
 
-                # Strategy 3: Try to match by slug from URL path
+                # Strategy 3: slug match from URL path
                 try:
                     slug = normalized.rstrip("/").split("/")[-1]
                     if slug and slug not in {"", "index.html", "index.php"}:
@@ -835,7 +1104,10 @@ class WpRestClient:
                         if r.status_code == 200:
                             items = r.json()
                             if isinstance(items, list) and len(items) > 0:
-                                return items[0], f"rest_slug_match:{ep}"
+                                # Slug must match exactly to avoid cross-type collisions.
+                                for it in items:
+                                    if it.get("slug") == slug:
+                                        return it, f"rest_slug_match:{ep}"
                 except Exception:
                     pass
 

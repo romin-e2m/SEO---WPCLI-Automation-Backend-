@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse, urljoin, urlunparse
 
-from playwright.async_api import Playwright, async_playwright, Page
+from playwright.async_api import Locator, Playwright, async_playwright, Page
 
 logger = logging.getLogger(__name__)
 
@@ -657,7 +657,133 @@ class WordPressPlaywright:
                 "logs": self.logger.get_logs(),
                 "screenshots": self.logger.get_screenshots()
             }
-    
+
+    async def _safe_scroll_into_view(self, page: Page, target, *, timeout_ms: int = 5000) -> None:
+        """
+        Scroll into view without burning the page default timeout (45s/90s in light_mode).
+
+        Gutenberg metabox roots often sit in nested scroll containers; Playwright's
+        scroll_into_view_if_needed can retry until the full default timeout even when
+        the node is attached. Prefer a short timeout, then native scrollIntoView.
+        """
+        try:
+            await target.scroll_into_view_if_needed(timeout=timeout_ms)
+        except Exception:
+            try:
+                await target.evaluate(
+                    "el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})"
+                )
+            except Exception:
+                pass
+        await page.wait_for_timeout(80)
+
+    async def _ensure_yoast_metabox_open(self, page: Page) -> None:
+        """Expand classic Yoast postbox if WordPress left it closed (snippet fields stay display:none)."""
+        box = page.locator("#wpseo_meta").first
+        try:
+            if await box.count() == 0:
+                return
+            cls = (await box.get_attribute("class")) or ""
+            if "closed" not in cls:
+                return
+            hdr = box.locator(".postbox-header, .hndle").first
+            if await hdr.count() > 0:
+                await hdr.click(timeout=4000, force=True)
+                await page.wait_for_timeout(350)
+        except Exception:
+            pass
+
+    async def _open_yoast_sidebar_tab_if_present(self, page: Page) -> None:
+        """If Yoast lives in the block editor right sidebar, activate its tab so preview fields are visible."""
+        try:
+            side = page.locator(".interface-complementary-area")
+            if await side.count() == 0:
+                return
+            tab = side.get_by_role("tab", name=re.compile(r"Yoast", re.I)).first
+            if await tab.count() == 0 or not await tab.is_visible():
+                return
+            if (await tab.get_attribute("aria-selected")) == "true":
+                return
+            await tab.click(timeout=4000)
+            await page.wait_for_timeout(450)
+        except Exception:
+            pass
+
+    async def _resolve_yoast_google_preview_cell(
+        self, page: Page, dom_id: str
+    ) -> Locator | None:
+        """
+        Return a locator for a Yoast snippet preview cell.
+
+        Yoast often mounts duplicate nodes (e.g. mobile/desktop); ``.first`` can be the hidden
+        copy, which makes ``click()`` wait until timeout with 'not visible'.
+        """
+        cells = page.locator(f"#{dom_id}")
+
+        async def _pick_visible() -> Locator | None:
+            nc = await cells.count()
+            for i in range(nc):
+                c = cells.nth(i)
+                try:
+                    if await c.is_visible():
+                        return c
+                except Exception:
+                    continue
+            return None
+
+        hit = await _pick_visible()
+        if hit:
+            return hit
+        await self._ensure_yoast_metabox_open(page)
+        await page.wait_for_timeout(350)
+        hit = await _pick_visible()
+        if hit:
+            return hit
+        n = await cells.count()
+        return cells.last if n else None
+
+    async def _focus_yoast_contenteditable(self, page: Page, loc) -> None:
+        """Focus snippet field: force-click first, then JS focus (avoids visible-only click waits)."""
+        try:
+            await loc.click(force=True, timeout=2500)
+            return
+        except Exception:
+            pass
+        try:
+            await loc.evaluate("el => { el.focus(); }")
+            await page.wait_for_timeout(120)
+        except Exception:
+            pass
+
+    async def _set_contenteditable_text_react(
+        self, loc, text: str
+    ) -> bool:
+        """
+        Set text on a React-controlled contenteditable when keyboard interaction misses the node.
+        Dispatches input events Yoast's listeners may rely on.
+        """
+        try:
+            return bool(
+                await loc.evaluate(
+                    """(el, txt) => {
+                    const t = String(txt ?? '');
+                    el.focus();
+                    el.textContent = t;
+                    el.dispatchEvent(new InputEvent('input', {
+                      bubbles: true,
+                      cancelable: true,
+                      inputType: 'insertText',
+                      data: t,
+                    }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return (el.textContent || '').trim() === t.trim();
+                }""",
+                    text,
+                )
+            )
+        except Exception:
+            return False
+
     async def _scroll_to_block_editor_metaboxes(self, page: Page) -> None:
         """Gutenberg loads SEO fields under **Meta Boxes** at the bottom — scroll there first."""
         for sel in (
@@ -668,7 +794,7 @@ class WordPressPlaywright:
             loc = page.locator(sel).first
             try:
                 if await loc.count() > 0:
-                    await loc.scroll_into_view_if_needed()
+                    await self._safe_scroll_into_view(page, loc)
                     await page.wait_for_timeout(120)
                     break
             except Exception:
@@ -690,9 +816,9 @@ class WordPressPlaywright:
         """
         await page.wait_for_timeout(200)
         await self._scroll_to_block_editor_metaboxes(page)
+        await self._ensure_yoast_metabox_open(page)
+        await self._open_yoast_sidebar_tab_if_present(page)
         await page.wait_for_timeout(600)
-
-        self.logger.add_log("📦 Locating Yoast meta field", "info", "")
 
         try:
             await page.locator("#yoast-google-preview-description-metabox").first.wait_for(
@@ -707,22 +833,21 @@ class WordPressPlaywright:
             )
 
         try:
-            loc = page.locator("#yoast-google-preview-description-metabox").first
+            loc = await self._resolve_yoast_google_preview_cell(
+                page, "yoast-google-preview-description-metabox"
+            )
             
-            if await loc.count() == 0:
+            if loc is None:
                 return False
             
             self.logger.add_log("🎯 Found meta description field", "info", "div#yoast-google-preview-description-metabox")
             
             # Scroll into view
-            await loc.scroll_into_view_if_needed()
+            await self._safe_scroll_into_view(page, loc)
             await page.wait_for_timeout(250)
             
             # Click to focus
-            try:
-                await loc.click(timeout=5000)
-            except Exception:
-                await loc.click(force=True, timeout=2000)
+            await self._focus_yoast_contenteditable(page, loc)
             
             await page.wait_for_timeout(150)
             
@@ -762,6 +887,13 @@ class WordPressPlaywright:
                 )
                 return True
             else:
+                if await self._set_contenteditable_text_react(loc, meta_description):
+                    self.logger.add_log(
+                        "✅ Meta description filled (JS fallback)",
+                        "success",
+                        f"{len(meta_description)} chars",
+                    )
+                    return True
                 self.logger.add_log(
                     "⚠️ Content mismatch",
                     "warning",
@@ -798,7 +930,7 @@ class WordPressPlaywright:
                 if await loc.count() == 0:
                     continue
                 
-                await loc.scroll_into_view_if_needed()
+                await self._safe_scroll_into_view(page, loc)
                 await page.wait_for_timeout(100)
                 
                 await loc.click(timeout=5000)
@@ -819,6 +951,8 @@ class WordPressPlaywright:
         """Fill SEO title in Yoast snippet preview (contenteditable, above meta description)."""
         await page.wait_for_timeout(200)
         await self._scroll_to_block_editor_metaboxes(page)
+        await self._ensure_yoast_metabox_open(page)
+        await self._open_yoast_sidebar_tab_if_present(page)
         await page.wait_for_timeout(600)
 
         self.logger.add_log("📦 Locating Yoast SEO title field", "info", "")
@@ -831,8 +965,10 @@ class WordPressPlaywright:
             self.logger.add_log("Timeout waiting for Yoast SEO title field", "warning", "")
 
         try:
-            loc = page.locator("#yoast-google-preview-title-metabox").first
-            if await loc.count() == 0:
+            loc = await self._resolve_yoast_google_preview_cell(
+                page, "yoast-google-preview-title-metabox"
+            )
+            if loc is None:
                 return False
 
             self.logger.add_log(
@@ -840,12 +976,9 @@ class WordPressPlaywright:
                 "info",
                 "div#yoast-google-preview-title-metabox",
             )
-            await loc.scroll_into_view_if_needed()
+            await self._safe_scroll_into_view(page, loc)
             await page.wait_for_timeout(250)
-            try:
-                await loc.click(timeout=5000)
-            except Exception:
-                await loc.click(force=True, timeout=2000)
+            await self._focus_yoast_contenteditable(page, loc)
             await page.wait_for_timeout(150)
             await page.keyboard.press("Control+A")
             await page.wait_for_timeout(50)
@@ -863,6 +996,13 @@ class WordPressPlaywright:
                     "✅ SEO title filled",
                     "success",
                     f"{len(final_text)} chars",
+                )
+                return True
+            if await self._set_contenteditable_text_react(loc, meta_title):
+                self.logger.add_log(
+                    "✅ SEO title filled (JS fallback)",
+                    "success",
+                    f"{len(meta_title)} chars",
                 )
                 return True
             self.logger.add_log(
@@ -890,7 +1030,7 @@ class WordPressPlaywright:
             try:
                 if await loc.count() == 0:
                     continue
-                await loc.scroll_into_view_if_needed()
+                await self._safe_scroll_into_view(page, loc)
                 await page.wait_for_timeout(100)
                 await loc.click(timeout=5000)
                 await loc.fill(meta_title, timeout=15000, force=True)
@@ -917,7 +1057,7 @@ class WordPressPlaywright:
                     continue
                 if not await loc.is_visible():
                     continue
-                await loc.scroll_into_view_if_needed()
+                await self._safe_scroll_into_view(page, loc)
                 try:
                     async with page.expect_response(
                         _is_wordpress_editor_save_response,
@@ -943,7 +1083,7 @@ class WordPressPlaywright:
                 "button", name=re.compile(r"Update|Save|Publish", re.I)
             ).first
             if await pub.count() > 0 and await pub.is_visible():
-                await pub.scroll_into_view_if_needed()
+                await self._safe_scroll_into_view(page, pub)
                 try:
                     async with page.expect_response(
                         _is_wordpress_editor_save_response,
@@ -1105,7 +1245,7 @@ class WordPressPlaywright:
                 page_slug,
             )
             try:
-                await page_link.scroll_into_view_if_needed()
+                await self._safe_scroll_into_view(page, page_link)
                 await page.wait_for_timeout(300)
             except Exception:
                 pass
