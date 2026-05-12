@@ -34,7 +34,7 @@ from app.services.monitor_broadcast import (
 
 logger = logging.getLogger(__name__)
 
-_ORDER = ("on_page", "meta", "images", "url_cleanup", "redirects_301")
+_ORDER = ("on_page", "meta", "meta_title", "images", "url_cleanup", "redirects_301")
 
 
 def _max_run_rows() -> int:
@@ -110,25 +110,14 @@ def _dry_on_page(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         )
 
     summ = WpRestClient.extract_summary_fields(obj)
-    cur_title = _s(summ.get("title"))
     raw_content = summ.get("content")
     cur_content = raw_content if isinstance(raw_content, str) else ""
     cur_h1 = WpRestClient.first_h1_inner_text(cur_content) or ""
 
-    rec_title = _s(v.get("recommended_title"))
     rec_h1 = _s(v.get("recommended_h1"))
     rec_content = _s(v.get("recommended_content"))
 
-    # H1 handling: only block if H1 change is requested but no <h1> exists AND user wants to replace it
-    # But if user is only providing H1 without knowing current structure, we can create a warning instead
-    if rec_h1 and not cur_h1 and not rec_content:
-        # Only H1 is being changed but no current H1 exists
-        # This is a warning, not a blocker - we can add an H1 tag
-        pass
-
     diffs: list[FieldDiff] = []
-    if rec_title and rec_title != cur_title:
-        diffs.append(FieldDiff(field="title", current=cur_title, proposed=rec_title))
     if rec_h1 and rec_h1 != cur_h1:
         diffs.append(FieldDiff(field="h1", current=cur_h1, proposed=rec_h1))
     if rec_content and rec_content != cur_content:
@@ -388,6 +377,92 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         post_id=pid,
         resolution_method=res.method,
         diffs=[FieldDiff(field="meta_description", current=cur_meta, proposed=rec_meta)],
+    )
+
+
+def _dry_meta_title(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
+    """Dry-run for SEO title (meta title) updates."""
+    v = row.values
+    page_url = _s(v.get("page_url"))
+    rec_title = _s(v.get("recommended_meta_title"))
+
+    if not page_url:
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Page URL is missing.",
+        )
+
+    if not rec_title:
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Recommended meta title is missing.",
+        )
+
+    res = resolve_post_url(site, page_url)
+    if not res.found or not res.post:
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="blocked",
+            message="Could not resolve page URL to a post or page.",
+            resolution_method=res.method,
+        )
+
+    pid = res.post.id
+    client = rest_client(site)
+    try:
+        obj = client.get_post(pid)
+    except Exception as e:
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="error",
+            message=f"REST fetch failed: {e}",
+            post_id=pid,
+            resolution_method=res.method,
+        )
+
+    cur_title = ""
+    yoast_meta = obj.get("meta", {})
+    if isinstance(yoast_meta, dict):
+        cur_title = _s(yoast_meta.get("_yoast_wpseo_title", ""))
+    if not cur_title and isinstance(yoast_meta, dict):
+        cur_title = _s(yoast_meta.get("rank_math_title", "")) or _s(
+            yoast_meta.get("_rank_math_title", "")
+        )
+    if not cur_title and isinstance(yoast_meta, dict):
+        cur_title = _s(yoast_meta.get("_seopress_titles_title", ""))
+    if not cur_title:
+        yoast_head_json = obj.get("yoast_head_json", {})
+        if isinstance(yoast_head_json, dict):
+            cur_title = _s(yoast_head_json.get("title", ""))
+
+    if rec_title == cur_title:
+        return DryRunRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="no_change",
+            post_id=pid,
+            resolution_method=res.method,
+        )
+
+    return DryRunRowResult(
+        action_type="meta_title",
+        sheet_name=row.sheet_name,
+        row_index=row.row_index,
+        outcome="change",
+        post_id=pid,
+        resolution_method=res.method,
+        diffs=[FieldDiff(field="meta_title", current=cur_title, proposed=rec_title)],
     )
 
 
@@ -820,6 +895,377 @@ async def _exec_meta_playwright(
         )
 
 
+def _exec_meta_title_via_rest(
+    site: SiteAccess,
+    row: NormalizedRow,
+    pid: int,
+    rec_title: str,
+    seo_plugin: str | None,
+    *,
+    page_url: str = "",
+    old_title: str | None = None,
+) -> ExecuteRowResult:
+    """Apply SEO title via REST."""
+    client = rest_client(site)
+    base_detail = dict(
+        source_url=page_url,
+        url=page_url,
+        old_meta_title=old_title,
+        new_meta_title=rec_title,
+    )
+    try:
+        obj = client.update_seo_meta_title(pid, rec_title, seo_plugin=seo_plugin)
+        if not obj or not isinstance(obj, dict):
+            logger.warning(
+                "Unexpected response from update_seo_meta_title for post %s",
+                pid,
+            )
+            return ExecuteRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Invalid response from SEO title update (REST API may have permission restrictions)",
+                post_id=pid,
+                detail=_detail(**base_detail),
+            )
+        post_id_returned = obj.get("id")
+        if not post_id_returned or post_id_returned != pid:
+            logger.warning(
+                "SEO title update for post %s returned unexpected post id: %s",
+                pid,
+                post_id_returned,
+            )
+            return ExecuteRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Post ID mismatch in response (REST API may have permission restrictions)",
+                post_id=pid,
+                detail=_detail(**base_detail, raw_id=post_id_returned),
+            )
+        logger.info("Successfully updated post %s SEO title (REST)", pid)
+    except Exception as e:
+        logger.error(
+            "Failed to update SEO title for post %s: %s: %s",
+            pid,
+            type(e).__name__,
+            str(e),
+        )
+        return ExecuteRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message=(
+                f"SEO title update failed: {str(e)}. REST API may have permission "
+                "restrictions - consider using WP-CLI or Playwright."
+            ),
+            post_id=pid,
+            detail=_detail(**base_detail),
+        )
+
+    return ExecuteRowResult(
+        action_type="meta_title",
+        sheet_name=row.sheet_name,
+        row_index=row.row_index,
+        outcome="updated",
+        post_id=pid,
+        detail=_detail(**base_detail, raw_id=post_id_returned),
+    )
+
+
+async def _exec_meta_title_playwright_batch_run(
+    site: SiteAccess,
+    jobs: list[tuple[NormalizedRow, int, str, str, str | None]],
+) -> list[ExecuteRowResult]:
+    """One browser session: login once, then update SEO title for each job."""
+    if not site.playwright:
+        raise ValueError("Playwright credentials not provided")
+
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await launch_chromium(p, headless=should_run_headless())
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 1024},
+            ignore_https_errors=True,
+        )
+        page = await context.new_page()
+        page.set_default_timeout(45000)
+        page.set_default_navigation_timeout(45000)
+
+        wp = WordPressPlaywright(
+            site.playwright.admin_url,
+            site.playwright.username,
+            site.playwright.password.get_secret_value(),
+        )
+
+        if not await wp.login(page):
+            await context.close()
+            await browser.close()
+            fail_logs = wp.logger.get_logs()
+            return [
+                ExecuteRowResult(
+                    action_type="meta_title",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Failed to log in to WordPress admin panel",
+                    detail=_detail(
+                        source_url=page_url,
+                        url=page_url,
+                        old_meta_title=old_meta,
+                        new_meta_title=rec_title,
+                        playwright_logs=fail_logs,
+                    ),
+                    post_id=pid,
+                )
+                for row, pid, page_url, rec_title, old_meta in jobs
+            ]
+
+        out: list[ExecuteRowResult] = []
+        for row, pid, page_url, rec_title, old_meta in jobs:
+            wp.logger.clear_logs()
+            result = await wp.update_meta_title(
+                page_url,
+                rec_title,
+                page,
+                post_id=pid,
+                light_mode=True,
+            )
+            logs = wp.logger.get_logs()
+            if result.get("status") == "updated":
+                out.append(
+                    ExecuteRowResult(
+                        action_type="meta_title",
+                        sheet_name=row.sheet_name,
+                        row_index=row.row_index,
+                        outcome="updated",
+                        post_id=pid,
+                        detail=_detail(
+                            source_url=page_url,
+                            url=page_url,
+                            old_meta_title=old_meta,
+                            new_meta_title=rec_title,
+                            playwright_logs=logs,
+                            raw_id=pid,
+                        ),
+                    )
+                )
+            else:
+                out.append(
+                    ExecuteRowResult(
+                        action_type="meta_title",
+                        sheet_name=row.sheet_name,
+                        row_index=row.row_index,
+                        outcome="failed",
+                        message=result.get("error", "Unknown error"),
+                        detail=_detail(
+                            source_url=page_url,
+                            url=page_url,
+                            old_meta_title=old_meta,
+                            new_meta_title=rec_title,
+                            playwright_logs=logs,
+                        ),
+                        post_id=pid,
+                    )
+                )
+
+        await context.close()
+        await browser.close()
+        return out
+
+
+def _exec_meta_title_consecutive_playwright_batch(
+    site: SiteAccess,
+    batch: list[NormalizedRow],
+    seo_plugin: str | None,
+) -> list[ExecuteRowResult]:
+    """Dry-run each SEO title row; run one Playwright session for all rows that need a change."""
+    n = len(batch)
+    results: list[ExecuteRowResult | None] = [None] * n
+    jobs: list[tuple[int, NormalizedRow, int, str, str, str | None]] = []
+
+    for i, row in enumerate(batch):
+        dr = _dry_meta_title(site, row)
+        v = row.values
+        page_url = _s(v.get("page_url"))
+        rec_title = _s(v.get("recommended_meta_title"))
+        old_title: str | None = None
+        for d in dr.diffs:
+            if d.field == "meta_title":
+                old_title = d.current
+                break
+
+        if dr.outcome != "change":
+            results[i] = ExecuteRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="skipped" if dr.outcome == "no_change" else "failed",
+                message=dr.message,
+                post_id=dr.post_id,
+                detail=_detail(
+                    source_url=page_url,
+                    url=page_url,
+                    old_meta_title=old_title,
+                    new_meta_title=rec_title,
+                ),
+            )
+            continue
+
+        pid = dr.post_id
+        if not pid:
+            results[i] = ExecuteRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Missing post id.",
+                detail=_detail(
+                    source_url=page_url,
+                    url=page_url,
+                    old_meta_title=old_title,
+                    new_meta_title=rec_title,
+                ),
+            )
+            continue
+
+        jobs.append((i, row, pid, page_url, rec_title, old_title))
+
+    if jobs:
+        ordered = [(row, pid, url, title, old) for (_i, row, pid, url, title, old) in jobs]
+        try:
+            pw_list = asyncio.run(_exec_meta_title_playwright_batch_run(site, ordered))
+        except RuntimeError as e:
+            if "asyncio.run() cannot be called from a running event loop" in str(e):
+                logger.warning(
+                    "asyncio.run unavailable for meta_title batch; using REST per row",
+                )
+                for _idx, row, pid, url, title, old in jobs:
+                    results[_idx] = _exec_meta_title_via_rest(
+                        site,
+                        row,
+                        pid,
+                        title,
+                        seo_plugin,
+                        page_url=url,
+                        old_title=old,
+                    )
+            else:
+                raise
+        else:
+            for k, (idx, row, pid, url, title, old) in enumerate(jobs):
+                results[idx] = pw_list[k]
+
+    return [r for r in results if r is not None]
+
+
+async def _exec_meta_title_playwright(
+    site: SiteAccess,
+    page_url: str,
+    meta_title: str,
+    row: NormalizedRow,
+    *,
+    post_id: int,
+    old_title: str | None = None,
+) -> ExecuteRowResult:
+    """Execute SEO title update using Playwright."""
+    if not site.playwright:
+        raise ValueError("Playwright credentials not provided")
+
+    base_detail = dict(
+        source_url=page_url,
+        url=page_url,
+        old_meta_title=old_title,
+        new_meta_title=meta_title,
+    )
+
+    try:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await launch_chromium(p, headless=should_run_headless())
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 1024},
+                ignore_https_errors=True,
+            )
+            page = await context.new_page()
+            page.set_default_timeout(45000)
+            page.set_default_navigation_timeout(45000)
+
+            wp = WordPressPlaywright(
+                site.playwright.admin_url,
+                site.playwright.username,
+                site.playwright.password.get_secret_value(),
+            )
+
+            if not await wp.login(page):
+                await context.close()
+                await browser.close()
+                return ExecuteRowResult(
+                    action_type="meta_title",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Failed to log in to WordPress admin panel",
+                    detail=_detail(**base_detail, playwright_logs=wp.logger.get_logs()),
+                    post_id=post_id,
+                )
+
+            result = await wp.update_meta_title(
+                page_url,
+                meta_title,
+                page,
+                post_id=post_id,
+                light_mode=True,
+            )
+
+            await context.close()
+            await browser.close()
+
+            logs = wp.logger.get_logs()
+
+            if result.get("status") == "updated":
+                logger.info(
+                    "SEO title updated via Playwright for post_id=%s url=%s",
+                    post_id,
+                    page_url,
+                )
+                return ExecuteRowResult(
+                    action_type="meta_title",
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="updated",
+                    post_id=post_id,
+                    detail=_detail(**base_detail, playwright_logs=logs, raw_id=post_id),
+                )
+            logger.error(f"Playwright SEO title update failed: {result.get('error')}")
+            return ExecuteRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message=result.get("error", "Unknown error"),
+                detail=_detail(**base_detail, playwright_logs=logs),
+                post_id=post_id,
+            )
+
+    except Exception as e:
+        logger.error(f"Playwright execution failed: {e}")
+        return ExecuteRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message=f"Playwright error: {str(e)}",
+            post_id=post_id,
+            detail=_detail(**base_detail),
+        )
+
+
 async def _exec_redirects_301_playwright(
     site: SiteAccess, from_url: str, to_url: str, row: NormalizedRow
 ) -> ExecuteRowResult:
@@ -935,6 +1381,8 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
                 rows_out.append(_dry_on_page(site, row))
             elif action == "meta":
                 rows_out.append(_dry_meta(site, row))
+            elif action == "meta_title":
+                rows_out.append(_dry_meta_title(site, row))
             elif action == "images":
                 rows_out.append(_dry_on_image(site, row))
             elif action == "url_cleanup":
@@ -984,7 +1432,6 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
 def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     v = row.values
     page_url = _s(v.get("page_url"))
-    rec_title = _s(v.get("recommended_title"))
     rec_h1 = _s(v.get("recommended_h1"))
     rec_content = _s(v.get("recommended_content"))
 
@@ -1021,13 +1468,8 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
     client = rest_client(site)
     obj = client.get_post(pid)
     summ = WpRestClient.extract_summary_fields(obj)
-    cur_title = _s(summ.get("title"))
     raw_content = summ.get("content")
     content = raw_content if isinstance(raw_content, str) else ""
-
-    new_title = cur_title
-    if rec_title:
-        new_title = rec_title
 
     new_content = content
     if rec_content:
@@ -1054,9 +1496,8 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             h1_html = f"<h1>{escaped_h1}</h1>"
             new_content = h1_html + "\n" + new_content
 
-    title_arg = new_title if new_title != cur_title else None
     content_arg = new_content if new_content != content else None
-    if title_arg is None and content_arg is None:
+    if content_arg is None:
         return ExecuteRowResult(
             action_type="on_page",
             sheet_name=row.sheet_name,
@@ -1068,8 +1509,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
         )
 
     fields_updated: list[str] = []
-    if title_arg is not None:
-        fields_updated.append("title")
     if rec_h1:
         fields_updated.append("h1")
     if content_arg is not None and "content" not in fields_updated:
@@ -1078,8 +1517,8 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             fields_updated.append("content")
 
     try:
-        out = client.update_post(pid, title=title_arg, content=content_arg)
-        logger.info(f"Updated post {pid}: title={bool(title_arg)}, content={bool(content_arg)}, response_id={out.get('id')}")
+        out = client.update_post(pid, title=None, content=content_arg)
+        logger.info(f"Updated post {pid}: content={bool(content_arg)}, response_id={out.get('id')}")
     except Exception as e:
         logger.error(f"Failed to update post {pid}: {type(e).__name__}: {str(e)}")
         return ExecuteRowResult(
@@ -1092,8 +1531,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
             detail=_detail(
                 url=page_url,
                 source_url=page_url,
-                old_title=cur_title,
-                new_title=new_title if new_title != cur_title else None,
                 raw_id=pid,
             ),
         )
@@ -1106,8 +1543,6 @@ def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
         detail=_detail(
             url=page_url,
             source_url=page_url,
-            old_title=cur_title,
-            new_title=new_title if new_title != cur_title else None,
             fields_updated=fields_updated or None,
             raw_id=out.get("id"),
         ),
@@ -1405,6 +1840,86 @@ def _exec_meta(site: SiteAccess, row: NormalizedRow, seo_plugin: str | None = No
     )
 
 
+def _exec_meta_title(site: SiteAccess, row: NormalizedRow, seo_plugin: str | None = None) -> ExecuteRowResult:
+    """Execute SEO title update via Playwright or REST API."""
+    v = row.values
+    page_url = _s(v.get("page_url"))
+    rec_title = _s(v.get("recommended_meta_title"))
+
+    dr = _dry_meta_title(site, row)
+    old_title: str | None = None
+    for d in dr.diffs:
+        if d.field == "meta_title":
+            old_title = d.current
+            break
+
+    if dr.outcome != "change":
+        return ExecuteRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="skipped" if dr.outcome == "no_change" else "failed",
+            message=dr.message,
+            post_id=dr.post_id,
+            detail=_detail(
+                source_url=page_url,
+                url=page_url,
+                old_meta_title=old_title,
+                new_meta_title=rec_title,
+            ),
+        )
+
+    pid = dr.post_id
+    if not pid:
+        return ExecuteRowResult(
+            action_type="meta_title",
+            sheet_name=row.sheet_name,
+            row_index=row.row_index,
+            outcome="failed",
+            message="Missing post id.",
+            detail=_detail(
+                source_url=page_url,
+                url=page_url,
+                old_meta_title=old_title,
+                new_meta_title=rec_title,
+            ),
+        )
+
+    if site.playwright:
+        try:
+            logger.info(f"Using Playwright to update SEO title for {page_url}")
+            try:
+                return asyncio.run(
+                    _exec_meta_title_playwright(
+                        site,
+                        page_url,
+                        rec_title,
+                        row,
+                        post_id=pid,
+                        old_title=old_title,
+                    )
+                )
+            except RuntimeError as e:
+                if "asyncio.run() cannot be called from a running event loop" in str(e):
+                    logger.warning(
+                        "Sync context only - Playwright UI automation not available in async context, using REST API"
+                    )
+                else:
+                    raise
+        except Exception as e:
+            logger.error(f"Playwright SEO title update failed, falling back to REST API: {e}")
+
+    return _exec_meta_title_via_rest(
+        site,
+        row,
+        pid,
+        rec_title,
+        seo_plugin,
+        page_url=page_url,
+        old_title=old_title,
+    )
+
+
 def _exec_redirects_301(site: SiteAccess, row: NormalizedRow, redirect_plugin: str | None = None) -> ExecuteRowResult:
     """Execute 301 redirect: REST API for capable plugins; Playwright for UI-only (e.g. EPS 301 Redirects)."""
     v = row.values
@@ -1532,7 +2047,26 @@ def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
                     rows_out.append(er)
                     emit_monitor_row_exec(
                         MONITOR_DEFAULT_ID,
-                        "meta",
+                        er.action_type,
+                        er.sheet_name,
+                        er.row_index,
+                        str(er.outcome),
+                        er.message,
+                    )
+                continue
+
+            if action == "meta_title" and site.playwright:
+                batch_title: list[NormalizedRow] = []
+                while i < len(rows_iter) and rows_iter[i][0] == "meta_title":
+                    batch_title.append(rows_iter[i][1])
+                    i += 1
+                for er in _exec_meta_title_consecutive_playwright_batch(
+                    site, batch_title, seo_plugin
+                ):
+                    rows_out.append(er)
+                    emit_monitor_row_exec(
+                        MONITOR_DEFAULT_ID,
+                        er.action_type,
                         er.sheet_name,
                         er.row_index,
                         str(er.outcome),
@@ -1544,6 +2078,8 @@ def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
                 rows_out.append(_exec_on_page(site, row))
             elif action == "meta":
                 rows_out.append(_exec_meta(site, row, seo_plugin))
+            elif action == "meta_title":
+                rows_out.append(_exec_meta_title(site, row, seo_plugin))
             elif action == "images":
                 rows_out.append(_exec_on_image(site, row))
             elif action == "url_cleanup":

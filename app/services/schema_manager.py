@@ -34,18 +34,16 @@ class SchemaManager:
         builtin = [
             ActionSchema(
                 id="on_page",
-                label="On-Page (Title / H1)",
-                description="Manage page titles and H1 tags",
+                label="On-Page (H1)",
+                description="Manage page H1 tags",
                 fields=[
                     FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
-                    FieldDefinition(key="current_title", label="Current title", type="text"),
-                    FieldDefinition(key="recommended_title", label="Recommended title", type="text"),
                     FieldDefinition(key="current_h1", label="Current H1", type="text"),
                     FieldDefinition(key="recommended_h1", label="Recommended H1", type="text"),
                     FieldDefinition(key="notes", label="Notes", type="text"),
                 ],
                 any_of_groups=[
-                    AnyOfGroup(fields=["recommended_title", "recommended_h1"])
+                    AnyOfGroup(fields=["recommended_h1"])
                 ],
                 created_at=datetime.now(timezone.utc).isoformat(),
                 updated_at=datetime.now(timezone.utc).isoformat(),
@@ -59,6 +57,20 @@ class SchemaManager:
                     FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
                     FieldDefinition(key="current_meta_description", label="Current meta description", type="text"),
                     FieldDefinition(key="recommended_meta_description", label="Recommended meta description", required=True, type="text"),
+                    FieldDefinition(key="notes", label="Notes", type="text"),
+                ],
+                created_at=datetime.now(timezone.utc).isoformat(),
+                updated_at=datetime.now(timezone.utc).isoformat(),
+                is_system=True,
+            ),
+            ActionSchema(
+                id="meta_title",
+                label="SEO meta title",
+                description="Update SEO title (search snippet title) for pages and posts",
+                fields=[
+                    FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
+                    FieldDefinition(key="current_meta_title", label="Current meta title", type="text"),
+                    FieldDefinition(key="recommended_meta_title", label="Recommended meta title", required=True, type="text"),
                     FieldDefinition(key="notes", label="Notes", type="text"),
                 ],
                 created_at=datetime.now(timezone.utc).isoformat(),

@@ -819,6 +819,91 @@ class WordPressPlaywright:
         
         return False
 
+    async def _fill_seo_meta_title(self, page: Page, meta_title: str) -> bool:
+        """Fill SEO title in Yoast snippet preview (contenteditable, above meta description)."""
+        await page.wait_for_timeout(200)
+        await self._scroll_to_block_editor_metaboxes(page)
+        await page.wait_for_timeout(600)
+
+        self.logger.add_log("📦 Locating Yoast SEO title field", "info", "")
+
+        try:
+            await page.locator("#yoast-google-preview-title-metabox").first.wait_for(
+                state="attached", timeout=15000
+            )
+        except Exception:
+            self.logger.add_log("Timeout waiting for Yoast SEO title field", "warning", "")
+
+        try:
+            loc = page.locator("#yoast-google-preview-title-metabox").first
+            if await loc.count() == 0:
+                return False
+
+            self.logger.add_log(
+                "🎯 Found SEO title field",
+                "info",
+                "div#yoast-google-preview-title-metabox",
+            )
+            await loc.scroll_into_view_if_needed()
+            await page.wait_for_timeout(250)
+            try:
+                await loc.click(timeout=5000)
+            except Exception:
+                await loc.click(force=True, timeout=2000)
+            await page.wait_for_timeout(150)
+            await page.keyboard.press("Control+A")
+            await page.wait_for_timeout(50)
+            await page.keyboard.press("Delete")
+            await page.wait_for_timeout(100)
+            current = await loc.inner_text()
+            if current.strip():
+                await loc.evaluate("el => { el.textContent = ''; }")
+                await page.wait_for_timeout(100)
+            await page.keyboard.type(meta_title, delay=1)
+            await page.wait_for_timeout(300)
+            final_text = await loc.inner_text()
+            if meta_title.strip() == final_text.strip() or meta_title in final_text:
+                self.logger.add_log(
+                    "✅ SEO title filled",
+                    "success",
+                    f"{len(final_text)} chars",
+                )
+                return True
+            self.logger.add_log(
+                "⚠️ SEO title content mismatch",
+                "warning",
+                f"Expected {len(meta_title)}, got {len(final_text)}",
+            )
+            return True
+        except Exception as e:
+            self.logger.add_log(f"Exception: {str(e)[:80]}", "error", "")
+            return False
+
+    async def _fill_seo_meta_title_fallback(self, page: Page, meta_title: str) -> bool:
+        """Fallback: classic Yoast / Rank Math input fields for SEO title."""
+        selectors = [
+            "#wpseo_meta input#yoast_wpseo_title",
+            "#wpseo_meta input[name='_yoast_wpseo_title']",
+            "input#yoast_wpseo_title",
+            "input[name='_yoast_wpseo_title']",
+            "#rank_math_title",
+            "input[name='rank_math_title']",
+        ]
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() == 0:
+                    continue
+                await loc.scroll_into_view_if_needed()
+                await page.wait_for_timeout(100)
+                await loc.click(timeout=5000)
+                await loc.fill(meta_title, timeout=15000, force=True)
+                self.logger.add_log("✅ SEO title filled via input", "success", sel)
+                return True
+            except Exception:
+                continue
+        return False
+
     async def _click_save_post_editor(self, page: Page) -> bool:
         """Save / update in block editor or classic editor; wait for WP save network call."""
         candidates = [
@@ -1118,6 +1203,215 @@ class WordPressPlaywright:
                 "screenshots": self.logger.get_screenshots()
             }
 
+    async def update_meta_title(
+        self,
+        page_url: str,
+        meta_title: str,
+        page: Page,
+        post_id: int | None = None,
+        *,
+        light_mode: bool = False,
+    ) -> dict[str, Any]:
+        """Update SEO title in the post editor (same navigation flow as ``update_meta_description``)."""
+        try:
+            nav_ms = 45000 if light_mode else 90000
+            page.set_default_timeout(nav_ms)
+            page.set_default_navigation_timeout(nav_ms)
+
+            self.logger.add_log("📝 Updating SEO title", "info", page_url)
+
+            parsed = urlparse(page_url)
+            page_path = parsed.path.strip("/")
+            page_slug = page_path.split("/")[-1] if page_path else ""
+
+            self.logger.add_log(
+                "🔍 Resolved target",
+                "info",
+                f"slug={page_slug!r} post_id={post_id}",
+            )
+
+            page_link = None
+
+            if post_id is not None:
+                edit_url = urljoin(
+                    self.admin_url, f"post.php?post={int(post_id)}&action=edit"
+                )
+                self.logger.add_log(
+                    "🌐 Opening editor by post ID (REST-matched URL)",
+                    "info",
+                    edit_url,
+                )
+                await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
+                post_nav_wait = 350 if light_mode else 900
+                await page.wait_for_timeout(post_nav_wait)
+                try:
+                    await page.wait_for_selector(
+                        "#wpseo_meta, .edit-post-layout__metaboxes",
+                        state="attached",
+                        timeout=15000 if light_mode else 20000,
+                    )
+                except Exception:
+                    pass
+            else:
+                if not page_slug:
+                    return {
+                        "status": "failed",
+                        "error": "No post_id and URL has no path segment to match.",
+                        "logs": self.logger.get_logs(),
+                        "screenshots": self.logger.get_screenshots(),
+                    }
+
+                screenshot_path = (
+                    f"{SCREENSHOTS_DIR}/07_pages_list_title_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+
+                page_link = await self._find_row_title_in_list(
+                    page, page_slug, post_type="page"
+                )
+                if page_link is None:
+                    self.logger.add_log(
+                        "📋 Not in pages list; trying posts",
+                        "info",
+                        page_slug,
+                    )
+                    page_link = await self._find_row_title_in_list(
+                        page, page_slug, post_type="post"
+                    )
+
+                await page.screenshot(path=screenshot_path)
+                self.logger.add_screenshot(screenshot_path)
+
+                if page_link is None:
+                    all_pages_text: list[str] = []
+                    for link in await page.query_selector_all("a.row-title"):
+                        text = (await link.text_content() or "").strip()
+                        all_pages_text.append(text)
+                    pages_summary = (
+                        ", ".join(all_pages_text[:10]) if all_pages_text else "No items"
+                    )
+                    if len(all_pages_text) > 10:
+                        pages_summary += f", and {len(all_pages_text) - 10} more..."
+                    self.logger.add_log(
+                        "❌ Content not found",
+                        "error",
+                        f"slug={page_slug!r} | {pages_summary}",
+                    )
+                    screenshot_path = (
+                        f"{SCREENSHOTS_DIR}/page_not_found_title_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                    )
+                    await page.screenshot(path=screenshot_path)
+                    self.logger.add_screenshot(screenshot_path)
+                    return {
+                        "status": "failed",
+                        "error": (
+                            f"Content for slug '{page_slug}' not found in WordPress "
+                            f"pages or posts lists. Available (last list): {pages_summary}"
+                        ),
+                        "logs": self.logger.get_logs(),
+                        "screenshots": self.logger.get_screenshots(),
+                    }
+
+                self.logger.add_log(
+                    "✅ Matched list row; opening editor",
+                    "success",
+                    page_slug,
+                )
+                try:
+                    await page_link.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(300)
+                except Exception:
+                    pass
+                await page_link.click(timeout=15000)
+                await page.wait_for_timeout(800 if light_mode else 1500)
+
+            if not light_mode:
+                screenshot_path = (
+                    f"{SCREENSHOTS_DIR}/08_page_editor_title_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                await page.screenshot(path=screenshot_path)
+                self.logger.add_screenshot(screenshot_path)
+
+            self.logger.add_log("✅ Editor loaded; filling SEO title", "success", "")
+
+            filled = await self._fill_seo_meta_title(page, meta_title)
+            if not filled:
+                filled = await self._fill_seo_meta_title_fallback(page, meta_title)
+            if not filled:
+                screenshot_path = (
+                    f"{SCREENSHOTS_DIR}/meta_title_field_not_found_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                await page.screenshot(path=screenshot_path)
+                self.logger.add_screenshot(screenshot_path)
+                return {
+                    "status": "failed",
+                    "error": "SEO title field not found (Yoast/Rank Math).",
+                    "logs": self.logger.get_logs(),
+                    "screenshots": self.logger.get_screenshots(),
+                }
+
+            if not light_mode:
+                screenshot_path = (
+                    f"{SCREENSHOTS_DIR}/09_meta_title_filled_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                await page.screenshot(path=screenshot_path)
+                self.logger.add_screenshot(screenshot_path)
+
+            if not await self._click_save_post_editor(page):
+                self.logger.add_log(
+                    "⚠️  Could not click save; SEO title may be unsaved",
+                    "warning",
+                    "",
+                )
+
+            await page.wait_for_timeout(900 if light_mode else 2500)
+
+            if not light_mode:
+                screenshot_path = (
+                    f"{SCREENSHOTS_DIR}/10_meta_title_saved_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                await page.screenshot(path=screenshot_path)
+                self.logger.add_screenshot(screenshot_path)
+
+            self.logger.add_log(
+                "✅ SEO title flow complete",
+                "success",
+                page_slug or str(post_id),
+            )
+
+            return {
+                "status": "updated",
+                "page_url": page_url,
+                "meta_title": meta_title,
+                "post_id": post_id,
+                "logs": self.logger.get_logs(),
+                "screenshots": self.logger.get_screenshots(),
+            }
+
+        except Exception as e:
+            self.logger.add_log("❌ SEO title update failed", "error", str(e))
+            try:
+                screenshot_path = (
+                    f"{SCREENSHOTS_DIR}/error_meta_title_update_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                await page.screenshot(path=screenshot_path)
+                self.logger.add_screenshot(screenshot_path)
+            except Exception:
+                pass
+            logger.error(f"Failed to update SEO title: {e}")
+            return {
+                "status": "failed",
+                "error": str(e),
+                "logs": self.logger.get_logs(),
+                "screenshots": self.logger.get_screenshots(),
+            }
+
 
 async def run_playwright_automation(
     admin_url: str,
@@ -1210,6 +1504,15 @@ async def run_playwright_automation(
                     result = await wp.update_meta_description(
                         task["page_url"],
                         task["meta_description"],
+                        page,
+                        post_id=post_id,
+                    )
+                elif task_type == "meta_title":
+                    raw_pid = task.get("post_id")
+                    post_id = int(raw_pid) if raw_pid is not None else None
+                    result = await wp.update_meta_title(
+                        task["page_url"],
+                        task["meta_title"],
                         page,
                         post_id=post_id,
                     )

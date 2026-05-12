@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, HttpUrl
 ActionType = Literal[
     "on_page",
     "meta",
+    "meta_title",
     "images",
     "url_cleanup",
     "redirects_301",

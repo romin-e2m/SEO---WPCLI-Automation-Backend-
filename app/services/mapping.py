@@ -22,17 +22,15 @@ _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 # `any_of_groups` lets us require "at least one of" for actions like on_page.
 ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
     "on_page": {
-        "label": "On-Page (Title / H1)",
+        "label": "On-Page (H1)",
         "fields": [
             {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
-            {"key": "current_title", "label": "Current title", "required": False, "type": "text"},
-            {"key": "recommended_title", "label": "Recommended title", "required": False, "type": "text"},
             {"key": "current_h1", "label": "Current H1", "required": False, "type": "text"},
             {"key": "recommended_h1", "label": "Recommended H1", "required": False, "type": "text"},
             {"key": "notes", "label": "Notes", "required": False, "type": "text"},
         ],
         "any_of_groups": [
-            ["recommended_title", "recommended_h1"],
+            ["recommended_h1"],
         ],
     },
     "meta": {
@@ -41,6 +39,16 @@ ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
             {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
             {"key": "current_meta_description", "label": "Current meta description", "required": False, "type": "text"},
             {"key": "recommended_meta_description", "label": "Recommended meta description", "required": True, "type": "text"},
+            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
+        ],
+        "any_of_groups": [],
+    },
+    "meta_title": {
+        "label": "SEO meta title",
+        "fields": [
+            {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
+            {"key": "current_meta_title", "label": "Current meta title", "required": False, "type": "text"},
+            {"key": "recommended_meta_title", "label": "Recommended meta title", "required": True, "type": "text"},
             {"key": "notes", "label": "Notes", "required": False, "type": "text"},
         ],
         "any_of_groups": [],
@@ -81,14 +89,6 @@ ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
 # canonical_field -> list of header aliases (lower-cased, normalized).
 HEADER_ALIASES: dict[str, list[str]] = {
     "page_url": ["page url", "url", "address", "page", "page address", "landing page"],
-    "current_title": ["title tag", "current title", "title", "meta title", "page title"],
-    "recommended_title": [
-        "recommended title",
-        "new title",
-        "proposed title",
-        "suggested title",
-        "title (new)",
-    ],
     "current_h1": ["h1", "current h1"],
     "recommended_h1": ["recommended h1", "new h1", "proposed h1", "h1 (new)"],
     "current_meta_description": [
@@ -104,6 +104,21 @@ HEADER_ALIASES: dict[str, list[str]] = {
         "new meta",
         "meta description (new)",
         "meta (new)",
+    ],
+    "current_meta_title": [
+        "meta title",
+        "current meta title",
+        "seo title",
+        "current seo title",
+        "title tag",
+    ],
+    "recommended_meta_title": [
+        "recommended meta title",
+        "new meta title",
+        "proposed meta title",
+        "seo title (new)",
+        "recommended seo title",
+        "new seo title",
     ],
     "image_url": [
         "image url",
@@ -208,6 +223,8 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
             name_hits["meta"] = name_hits.get("meta", 0) + 5
         elif n == "meta":
             name_hits["meta"] = name_hits.get("meta", 0) + 5
+        if "meta" in n and "title" in n and "description" not in n:
+            name_hits["meta_title"] = name_hits.get("meta_title", 0) + 5
         if "url" in n and ("cleanup" in n or "clean" in n or "replace" in n):
             name_hits["url_cleanup"] = name_hits.get("url_cleanup", 0) + 5
         if "on_page" in n.replace(" ", "_") or "on page" in n or "title" in n or "h1" in n:
