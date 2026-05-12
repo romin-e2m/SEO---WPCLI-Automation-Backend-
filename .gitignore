@@ -5,9 +5,19 @@ __pycache__/
 Dockerfile
 docker-compose.yml
 test/
+tests/
 extra/
 .pytest_cache/
 .DS_Store
+
+# Logs
+*.log
+*.log.*
+
+# Test files (local / pytest)
+test_*.py
+*_test.py
+test_playwright_system.py
 
 # Graphify (local-only; never commit)
 graphify-out/
