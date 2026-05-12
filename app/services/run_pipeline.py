@@ -31,6 +31,7 @@ from app.services.monitor_broadcast import (
     emit_monitor_row_dry,
     emit_monitor_row_exec,
 )
+from app.services.execution_logger import ExecutionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,24 @@ def _detail(**kwargs: Any) -> dict[str, Any]:
 
 def _count_grouped(grouped: dict[str, list[NormalizedRow]]) -> int:
     return sum(len(rows) for rows in grouped.values())
+
+
+def _safe_async_run(coro):
+    """
+    Safely run an async coroutine, handling event loop conflicts.
+    
+    If called from within an event loop (e.g., FastAPI async context),
+    returns the coroutine directly for await. Otherwise uses asyncio.run().
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    
+    if loop is not None:
+        return coro
+    
+    return asyncio.run(coro)
 
 
 def _iter_rows(grouped: dict[str, list[NormalizedRow]]):
@@ -2021,105 +2040,153 @@ def _exec_redirects_301(site: SiteAccess, row: NormalizedRow, redirect_plugin: s
 
 
 
-def run_execute(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redirect_plugin: str | None = None, seo_plugin: str | None = None) -> ExecuteResponse:
+def run_execute(
+    site: SiteAccess,
+    grouped: dict[str, list[NormalizedRow]],
+    redirect_plugin: str | None = None,
+    seo_plugin: str | None = None,
+    execution_logger: ExecutionLogger | None = None,
+) -> ExecuteResponse:
     total = _count_grouped(grouped)
     limit = _max_run_rows()
     if total > limit:
+        if execution_logger is not None:
+            execution_logger.log_sync(
+                "execute_rejected",
+                "error",
+                f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).",
+            )
+            execution_logger.mark_complete()
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
+
+    def _log_row(er: ExecuteRowResult) -> None:
+        if execution_logger is None:
+            return
+        st = (
+            "success"
+            if er.outcome == "updated"
+            else ("warning" if er.outcome == "skipped" else "error")
+        )
+        execution_logger.log_sync(
+            f"{er.action_type} row {er.row_index}",
+            st,
+            er.message or er.outcome,
+        )
 
     clear_monitor_logs(MONITOR_DEFAULT_ID)
     emit_monitor_phase(MONITOR_DEFAULT_ID, "Execute started", f"{total} row(s)")
+    if execution_logger is not None:
+        execution_logger.log_sync(
+            "execute_started", "pending", f"{total} row(s) to process"
+        )
 
     rows_out: list[ExecuteRowResult] = []
-    rows_iter = list(_iter_rows(grouped))
-    i = 0
-    while i < len(rows_iter):
-        action, row = rows_iter[i]
-        try:
-            if action == "meta" and site.playwright:
-                batch: list[NormalizedRow] = []
-                while i < len(rows_iter) and rows_iter[i][0] == "meta":
-                    batch.append(rows_iter[i][1])
-                    i += 1
-                for er in _exec_meta_consecutive_playwright_batch(
-                    site, batch, seo_plugin
-                ):
-                    rows_out.append(er)
-                    emit_monitor_row_exec(
-                        MONITOR_DEFAULT_ID,
-                        er.action_type,
-                        er.sheet_name,
-                        er.row_index,
-                        str(er.outcome),
-                        er.message,
-                    )
-                continue
+    try:
+        rows_iter = list(_iter_rows(grouped))
+        i = 0
+        while i < len(rows_iter):
+            action, row = rows_iter[i]
+            try:
+                if action == "meta" and site.playwright:
+                    batch: list[NormalizedRow] = []
+                    while i < len(rows_iter) and rows_iter[i][0] == "meta":
+                        batch.append(rows_iter[i][1])
+                        i += 1
+                    for er in _exec_meta_consecutive_playwright_batch(
+                        site, batch, seo_plugin
+                    ):
+                        rows_out.append(er)
+                        emit_monitor_row_exec(
+                            MONITOR_DEFAULT_ID,
+                            er.action_type,
+                            er.sheet_name,
+                            er.row_index,
+                            str(er.outcome),
+                            er.message,
+                        )
+                        _log_row(er)
+                    continue
 
-            if action == "meta_title" and site.playwright:
-                batch_title: list[NormalizedRow] = []
-                while i < len(rows_iter) and rows_iter[i][0] == "meta_title":
-                    batch_title.append(rows_iter[i][1])
-                    i += 1
-                for er in _exec_meta_title_consecutive_playwright_batch(
-                    site, batch_title, seo_plugin
-                ):
-                    rows_out.append(er)
-                    emit_monitor_row_exec(
-                        MONITOR_DEFAULT_ID,
-                        er.action_type,
-                        er.sheet_name,
-                        er.row_index,
-                        str(er.outcome),
-                        er.message,
-                    )
-                continue
+                if action == "meta_title" and site.playwright:
+                    batch_title: list[NormalizedRow] = []
+                    while i < len(rows_iter) and rows_iter[i][0] == "meta_title":
+                        batch_title.append(rows_iter[i][1])
+                        i += 1
+                    for er in _exec_meta_title_consecutive_playwright_batch(
+                        site, batch_title, seo_plugin
+                    ):
+                        rows_out.append(er)
+                        emit_monitor_row_exec(
+                            MONITOR_DEFAULT_ID,
+                            er.action_type,
+                            er.sheet_name,
+                            er.row_index,
+                            str(er.outcome),
+                            er.message,
+                        )
+                        _log_row(er)
+                    continue
 
-            if action == "on_page":
-                rows_out.append(_exec_on_page(site, row))
-            elif action == "meta":
-                rows_out.append(_exec_meta(site, row, seo_plugin))
-            elif action == "meta_title":
-                rows_out.append(_exec_meta_title(site, row, seo_plugin))
-            elif action == "images":
-                rows_out.append(_exec_on_image(site, row))
-            elif action == "url_cleanup":
-                rows_out.append(_exec_url_cleanup(site, row))
-            elif action == "redirects_301":
-                rows_out.append(_exec_redirects_301(site, row, redirect_plugin))
-        except Exception as e:
-            logger.error(f"Execute error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
-            rows_out.append(ExecuteRowResult(
-                action_type=action,
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="failed",
-                message=f"Internal error: {str(e)}",
-            ))
-        er = rows_out[-1]
-        emit_monitor_row_exec(
+                if action == "on_page":
+                    rows_out.append(_exec_on_page(site, row))
+                elif action == "meta":
+                    rows_out.append(_exec_meta(site, row, seo_plugin))
+                elif action == "meta_title":
+                    rows_out.append(_exec_meta_title(site, row, seo_plugin))
+                elif action == "images":
+                    rows_out.append(_exec_on_image(site, row))
+                elif action == "url_cleanup":
+                    rows_out.append(_exec_url_cleanup(site, row))
+                elif action == "redirects_301":
+                    rows_out.append(_exec_redirects_301(site, row, redirect_plugin))
+            except Exception as e:
+                logger.error(
+                    f"Execute error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}"
+                )
+                rows_out.append(
+                    ExecuteRowResult(
+                        action_type=action,
+                        sheet_name=row.sheet_name,
+                        row_index=row.row_index,
+                        outcome="failed",
+                        message=f"Internal error: {str(e)}",
+                    )
+                )
+            er = rows_out[-1]
+            emit_monitor_row_exec(
+                MONITOR_DEFAULT_ID,
+                action,
+                er.sheet_name,
+                er.row_index,
+                str(er.outcome),
+                er.message,
+            )
+            _log_row(er)
+            i += 1
+
+        updated = sum(1 for r in rows_out if r.outcome == "updated")
+        skipped = sum(1 for r in rows_out if r.outcome == "skipped")
+        failed = sum(1 for r in rows_out if r.outcome == "failed")
+
+        emit_monitor_phase(
             MONITOR_DEFAULT_ID,
-            action,
-            er.sheet_name,
-            er.row_index,
-            str(er.outcome),
-            er.message,
+            "Execute finished",
+            f"updated={updated}, skipped={skipped}, failed={failed}",
         )
-        i += 1
+        if execution_logger is not None:
+            execution_logger.log_sync(
+                "execute_finished",
+                "success",
+                f"updated={updated}, skipped={skipped}, failed={failed}",
+            )
 
-    updated = sum(1 for r in rows_out if r.outcome == "updated")
-    skipped = sum(1 for r in rows_out if r.outcome == "skipped")
-    failed = sum(1 for r in rows_out if r.outcome == "failed")
-
-    emit_monitor_phase(
-        MONITOR_DEFAULT_ID,
-        "Execute finished",
-        f"updated={updated}, skipped={skipped}, failed={failed}",
-    )
-
-    return ExecuteResponse(
-        rows_processed=len(rows_out),
-        updated=updated,
-        skipped=skipped,
-        failed=failed,
-        rows=rows_out,
-    )
+        return ExecuteResponse(
+            rows_processed=len(rows_out),
+            updated=updated,
+            skipped=skipped,
+            failed=failed,
+            rows=rows_out,
+        )
+    finally:
+        if execution_logger is not None:
+            execution_logger.mark_complete()

@@ -1,9 +1,11 @@
 """
 Pydantic schemas for REST API task operations.
 """
-from pydantic import BaseModel, Field
-from typing import Any, Literal
-from app.services.wp_rest_api import TaskType, RedirectSource
+from typing import Any, Literal, Annotated, Union
+
+from pydantic import BaseModel, Field, SecretStr
+
+from app.services.wp_rest import RedirectSource, TaskType
 
 
 class DryRunRequest(BaseModel):
@@ -11,7 +13,7 @@ class DryRunRequest(BaseModel):
     task_type: TaskType
     site_url: str = Field(..., description="WordPress site URL")
     username: str = Field(..., description="WordPress username")
-    app_password: str = Field(..., description="Application password")
+    app_password: SecretStr = Field(..., description="Application password")
 
 
 class UpdateTitleDryRunRequest(DryRunRequest):
@@ -66,7 +68,7 @@ class ExecuteOperationRequest(BaseModel):
     task_type: TaskType
     site_url: str = Field(..., description="WordPress site URL")
     username: str = Field(..., description="WordPress username")
-    app_password: str = Field(..., description="Application password")
+    app_password: SecretStr = Field(..., description="Application password")
 
 
 class UpdateTitleExecuteRequest(ExecuteOperationRequest):
@@ -116,15 +118,21 @@ class OperationResponse(BaseModel):
     error: str | None = None
 
 
+BatchOperationItem = Annotated[
+    Union[
+        UpdateTitleExecuteRequest,
+        UpdateContentExecuteRequest,
+        UpdateAltTextExecuteRequest,
+        CleanupUrlsExecuteRequest,
+        CreateRedirectExecuteRequest,
+    ],
+    Field(discriminator="task_type"),
+]
+
+
 class BatchOperationRequest(BaseModel):
     """Request to execute multiple operations."""
-    operations: list[
-        UpdateTitleExecuteRequest
-        | UpdateContentExecuteRequest
-        | UpdateAltTextExecuteRequest
-        | CleanupUrlsExecuteRequest
-        | CreateRedirectExecuteRequest
-    ]
+    operations: list[BatchOperationItem]
     stop_on_error: bool = False
 
 

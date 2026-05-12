@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ from app.schemas.schema import (
     CreateActionSchemaRequest,
     UpdateActionSchemaRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SchemaManager:
@@ -134,10 +137,10 @@ class SchemaManager:
                 try:
                     schema = ActionSchema(**schema_data)
                     self._schemas[schema.id] = schema
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.warning(f"Failed to load schema {schema_data.get('id', 'unknown')}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load schemas from file {self.storage_path}: {e}")
 
     def _save_to_file(self) -> None:
         """Persist user-defined schemas to JSON file."""

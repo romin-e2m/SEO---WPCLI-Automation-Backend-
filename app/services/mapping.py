@@ -12,9 +12,12 @@ from app.schemas.workbook import (
     SheetMappingError,
     SheetSummary,
 )
-
-
-_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+from app.services.mapping_common import (
+    coerce_str as _coerce_str,
+    looks_like_url as _looks_like_url,
+    resolve_source_value as _resolve_mapped_cell,
+    validate_row_fields,
+)
 
 
 # canonical_field -> {required: bool, type: 'url'|'text'|'int'}
@@ -256,25 +259,6 @@ def guess_action_type(sheet_name: str, columns: list[str]) -> ActionType | None:
     return best
 
 
-def _coerce_str(v: Any) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, float):
-        # avoid "nan"
-        try:
-            import math
-
-            if math.isnan(v) or math.isinf(v):
-                return ""
-        except Exception:
-            pass
-    return str(v).strip()
-
-
-def _looks_like_url(v: str) -> bool:
-    return bool(_URL_RE.match(v))
-
-
 def _validate_static(mapping: SheetMapping, available_columns: list[str]) -> list[str]:
     """Static checks against the column_map without inspecting data rows."""
     issues: list[str] = []
@@ -311,16 +295,8 @@ def _resolve_source_value(
     row: dict[str, Any],
     available_columns: list[str],
 ) -> Any:
-    if not source_col:
-        return None
-    if source_col in row:
-        return row.get(source_col)
-    # case-insensitive fallback
-    target = _norm_header(source_col)
-    for c in available_columns:
-        if _norm_header(c) == target:
-            return row.get(c)
-    return None
+    _ = canonical_field
+    return _resolve_mapped_cell(source_col, row, available_columns, _norm_header)
 
 
 def _validate_row(
@@ -329,31 +305,8 @@ def _validate_row(
 ) -> tuple[bool, list[str]]:
     """Return (is_valid, skip_reasons). is_valid means it should be included in normalized output."""
     spec = ACTION_FIELDS[mapping.action_type]
-    reasons: list[str] = []
-
-    # row is "empty" if all mapped fields are blank: skip silently.
-    has_any_value = any(_coerce_str(v) for v in row_values.values())
-    if not has_any_value:
-        return False, ["empty_row"]
-
-    for f in spec["fields"]:
-        key: str = f["key"]
-        required: bool = bool(f["required"])
-        ftype: str = f["type"]
-        v = _coerce_str(row_values.get(key))
-        if not v:
-            if required:
-                reasons.append(f"missing:{key}")
-            continue
-        if ftype == "url" and not _looks_like_url(v):
-            reasons.append(f"invalid_url:{key}")
-
-    # any_of groups
-    for group in spec.get("any_of_groups", []):
-        if group and not any(_coerce_str(row_values.get(k)) for k in group):
-            reasons.append(f"missing_any_of:{'|'.join(group)}")
-
-    return (len(reasons) == 0), reasons
+    fields = [(str(f["key"]), bool(f["required"]), str(f["type"])) for f in spec["fields"]]
+    return validate_row_fields(row_values, fields, spec.get("any_of_groups", []))
 
 
 def validate_mapping(

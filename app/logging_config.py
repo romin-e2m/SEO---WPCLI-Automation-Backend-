@@ -11,7 +11,7 @@ LOGGING_CONFIG: dict[str, Any] = {
             "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         },
         "access": {
-            "format": "%(asctime)s - %(client_addr)s - %(request_line)s - %(status_code)s",
+            "format": "%(asctime)s - %(message)s",
         },
     },
     "filters": {

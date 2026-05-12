@@ -283,7 +283,7 @@ class WordPressPlaywright:
                     "success"
                 )
                 return True
-            except:
+            except Exception:
                 pass
             
             self.logger.add_log(
@@ -357,7 +357,7 @@ class WordPressPlaywright:
                 screenshot_path = f"{SCREENSHOTS_DIR}/error_login_failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                 await page.screenshot(path=screenshot_path)
                 self.logger.add_screenshot(screenshot_path)
-            except:
+            except Exception:
                 pass
             logger.error(f"WordPress login failed: {e}")
             return False
@@ -652,7 +652,7 @@ class WordPressPlaywright:
                 screenshot_path = f"{SCREENSHOTS_DIR}/error_redirect_creation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                 await page.screenshot(path=screenshot_path)
                 self.logger.add_screenshot(screenshot_path)
-            except:
+            except Exception:
                 pass
             logger.error(f"Failed to create redirect: {e}")
             return {
@@ -988,6 +988,145 @@ class WordPressPlaywright:
                 return link
         return None
 
+    async def _prepare_seo_post_editor(
+        self,
+        page: Page,
+        page_url: str,
+        post_id: int | None,
+        *,
+        light_mode: bool,
+        start_log_message: str,
+        shot_prefix_pages_list: str,
+        shot_prefix_not_found: str,
+        shot_prefix_editor: str,
+        editor_loaded_log: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Open the block editor for the SEO metabox. Returns ``(page_slug, None)`` or ``("", error)``."""
+        nav_ms = 45000 if light_mode else 90000
+        page.set_default_timeout(nav_ms)
+        page.set_default_navigation_timeout(nav_ms)
+
+        self.logger.add_log(start_log_message, "info", page_url)
+
+        parsed = urlparse(page_url)
+        page_path = parsed.path.strip("/")
+        page_slug = page_path.split("/")[-1] if page_path else ""
+
+        self.logger.add_log(
+            "🔍 Resolved target",
+            "info",
+            f"slug={page_slug!r} post_id={post_id}",
+        )
+
+        if post_id is not None:
+            edit_url = urljoin(
+                self.admin_url, f"post.php?post={int(post_id)}&action=edit"
+            )
+            self.logger.add_log(
+                "🌐 Opening editor by post ID (REST-matched URL)",
+                "info",
+                edit_url,
+            )
+            await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
+            post_nav_wait = 350 if light_mode else 900
+            await page.wait_for_timeout(post_nav_wait)
+            try:
+                await page.wait_for_selector(
+                    "#wpseo_meta, .edit-post-layout__metaboxes",
+                    state="attached",
+                    timeout=15000 if light_mode else 20000,
+                )
+            except Exception:
+                pass
+        else:
+            if not page_slug:
+                return (
+                    "",
+                    {
+                        "status": "failed",
+                        "error": "No post_id and URL has no path segment to match.",
+                        "logs": self.logger.get_logs(),
+                        "screenshots": self.logger.get_screenshots(),
+                    },
+                )
+
+            list_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            list_shot = f"{SCREENSHOTS_DIR}/{shot_prefix_pages_list}_{list_ts}.png"
+
+            page_link = await self._find_row_title_in_list(
+                page, page_slug, post_type="page"
+            )
+            if page_link is None:
+                self.logger.add_log(
+                    "📋 Not in pages list; trying posts",
+                    "info",
+                    page_slug,
+                )
+                page_link = await self._find_row_title_in_list(
+                    page, page_slug, post_type="post"
+                )
+
+            await page.screenshot(path=list_shot)
+            self.logger.add_screenshot(list_shot)
+
+            if page_link is None:
+                all_pages_text: list[str] = []
+                for link in await page.query_selector_all("a.row-title"):
+                    text = (await link.text_content() or "").strip()
+                    all_pages_text.append(text)
+                pages_summary = (
+                    ", ".join(all_pages_text[:10]) if all_pages_text else "No items"
+                )
+                if len(all_pages_text) > 10:
+                    pages_summary += f", and {len(all_pages_text) - 10} more..."
+                self.logger.add_log(
+                    "❌ Content not found",
+                    "error",
+                    f"slug={page_slug!r} | {pages_summary}",
+                )
+                nf_shot = (
+                    f"{SCREENSHOTS_DIR}/{shot_prefix_not_found}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                )
+                await page.screenshot(path=nf_shot)
+                self.logger.add_screenshot(nf_shot)
+                return (
+                    "",
+                    {
+                        "status": "failed",
+                        "error": (
+                            f"Content for slug '{page_slug}' not found in WordPress "
+                            f"pages or posts lists. Available (last list): {pages_summary}"
+                        ),
+                        "logs": self.logger.get_logs(),
+                        "screenshots": self.logger.get_screenshots(),
+                    },
+                )
+
+            self.logger.add_log(
+                "✅ Matched list row; opening editor",
+                "success",
+                page_slug,
+            )
+            try:
+                await page_link.scroll_into_view_if_needed()
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+            await page_link.click(timeout=15000)
+            await page.wait_for_timeout(800 if light_mode else 1500)
+
+        if not light_mode:
+            editor_shot = (
+                f"{SCREENSHOTS_DIR}/{shot_prefix_editor}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            )
+            await page.screenshot(path=editor_shot)
+            self.logger.add_screenshot(editor_shot)
+
+        self.logger.add_log(editor_loaded_log, "success", "")
+        return (page_slug, None)
+
     async def update_meta_description(
         self,
         page_url: str,
@@ -1007,127 +1146,19 @@ class WordPressPlaywright:
         ``light_mode``: fewer screenshots and shorter waits (used for batched meta runs).
         """
         try:
-            nav_ms = 45000 if light_mode else 90000
-            page.set_default_timeout(nav_ms)
-            page.set_default_navigation_timeout(nav_ms)
-
-            self.logger.add_log("📝 Updating meta description", "info", page_url)
-
-            parsed = urlparse(page_url)
-            page_path = parsed.path.strip("/")
-            page_slug = page_path.split("/")[-1] if page_path else ""
-
-            self.logger.add_log(
-                "🔍 Resolved target",
-                "info",
-                f"slug={page_slug!r} post_id={post_id}",
+            page_slug, prep_err = await self._prepare_seo_post_editor(
+                page,
+                page_url,
+                post_id,
+                light_mode=light_mode,
+                start_log_message="📝 Updating meta description",
+                shot_prefix_pages_list="07_pages_list",
+                shot_prefix_not_found="page_not_found",
+                shot_prefix_editor="08_page_editor",
+                editor_loaded_log="✅ Editor loaded; filling SEO meta",
             )
-
-            page_link = None
-
-            if post_id is not None:
-                edit_url = urljoin(
-                    self.admin_url, f"post.php?post={int(post_id)}&action=edit"
-                )
-                self.logger.add_log(
-                    "🌐 Opening editor by post ID (REST-matched URL)",
-                    "info",
-                    edit_url,
-                )
-                await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
-                post_nav_wait = 350 if light_mode else 900
-                await page.wait_for_timeout(post_nav_wait)
-                try:
-                    await page.wait_for_selector(
-                        "#wpseo_meta, .edit-post-layout__metaboxes",
-                        state="attached",
-                        timeout=15000 if light_mode else 20000,
-                    )
-                except Exception:
-                    pass
-            else:
-                if not page_slug:
-                    return {
-                        "status": "failed",
-                        "error": "No post_id and URL has no path segment to match.",
-                        "logs": self.logger.get_logs(),
-                        "screenshots": self.logger.get_screenshots(),
-                    }
-
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/07_pages_list_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-
-                page_link = await self._find_row_title_in_list(
-                    page, page_slug, post_type="page"
-                )
-                if page_link is None:
-                    self.logger.add_log(
-                        "📋 Not in pages list; trying posts",
-                        "info",
-                        page_slug,
-                    )
-                    page_link = await self._find_row_title_in_list(
-                        page, page_slug, post_type="post"
-                    )
-
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-
-                if page_link is None:
-                    all_pages_text: list[str] = []
-                    for link in await page.query_selector_all("a.row-title"):
-                        text = (await link.text_content() or "").strip()
-                        all_pages_text.append(text)
-                    pages_summary = (
-                        ", ".join(all_pages_text[:10]) if all_pages_text else "No items"
-                    )
-                    if len(all_pages_text) > 10:
-                        pages_summary += f", and {len(all_pages_text) - 10} more..."
-                    self.logger.add_log(
-                        "❌ Content not found",
-                        "error",
-                        f"slug={page_slug!r} | {pages_summary}",
-                    )
-                    screenshot_path = (
-                        f"{SCREENSHOTS_DIR}/page_not_found_"
-                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                    )
-                    await page.screenshot(path=screenshot_path)
-                    self.logger.add_screenshot(screenshot_path)
-                    return {
-                        "status": "failed",
-                        "error": (
-                            f"Content for slug '{page_slug}' not found in WordPress "
-                            f"pages or posts lists. Available (last list): {pages_summary}"
-                        ),
-                        "logs": self.logger.get_logs(),
-                        "screenshots": self.logger.get_screenshots(),
-                    }
-
-                self.logger.add_log(
-                    "✅ Matched list row; opening editor",
-                    "success",
-                    page_slug,
-                )
-                try:
-                    await page_link.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
-                except Exception:
-                    pass
-                await page_link.click(timeout=15000)
-                await page.wait_for_timeout(800 if light_mode else 1500)
-
-            if not light_mode:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/08_page_editor_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-
-            self.logger.add_log("✅ Editor loaded; filling SEO meta", "success", "")
+            if prep_err:
+                return prep_err
 
             if not await self._fill_seo_meta_description(page, meta_description):
                 screenshot_path = (
@@ -1214,127 +1245,19 @@ class WordPressPlaywright:
     ) -> dict[str, Any]:
         """Update SEO title in the post editor (same navigation flow as ``update_meta_description``)."""
         try:
-            nav_ms = 45000 if light_mode else 90000
-            page.set_default_timeout(nav_ms)
-            page.set_default_navigation_timeout(nav_ms)
-
-            self.logger.add_log("📝 Updating SEO title", "info", page_url)
-
-            parsed = urlparse(page_url)
-            page_path = parsed.path.strip("/")
-            page_slug = page_path.split("/")[-1] if page_path else ""
-
-            self.logger.add_log(
-                "🔍 Resolved target",
-                "info",
-                f"slug={page_slug!r} post_id={post_id}",
+            page_slug, prep_err = await self._prepare_seo_post_editor(
+                page,
+                page_url,
+                post_id,
+                light_mode=light_mode,
+                start_log_message="📝 Updating SEO title",
+                shot_prefix_pages_list="07_pages_list_title",
+                shot_prefix_not_found="page_not_found_title",
+                shot_prefix_editor="08_page_editor_title",
+                editor_loaded_log="✅ Editor loaded; filling SEO title",
             )
-
-            page_link = None
-
-            if post_id is not None:
-                edit_url = urljoin(
-                    self.admin_url, f"post.php?post={int(post_id)}&action=edit"
-                )
-                self.logger.add_log(
-                    "🌐 Opening editor by post ID (REST-matched URL)",
-                    "info",
-                    edit_url,
-                )
-                await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
-                post_nav_wait = 350 if light_mode else 900
-                await page.wait_for_timeout(post_nav_wait)
-                try:
-                    await page.wait_for_selector(
-                        "#wpseo_meta, .edit-post-layout__metaboxes",
-                        state="attached",
-                        timeout=15000 if light_mode else 20000,
-                    )
-                except Exception:
-                    pass
-            else:
-                if not page_slug:
-                    return {
-                        "status": "failed",
-                        "error": "No post_id and URL has no path segment to match.",
-                        "logs": self.logger.get_logs(),
-                        "screenshots": self.logger.get_screenshots(),
-                    }
-
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/07_pages_list_title_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-
-                page_link = await self._find_row_title_in_list(
-                    page, page_slug, post_type="page"
-                )
-                if page_link is None:
-                    self.logger.add_log(
-                        "📋 Not in pages list; trying posts",
-                        "info",
-                        page_slug,
-                    )
-                    page_link = await self._find_row_title_in_list(
-                        page, page_slug, post_type="post"
-                    )
-
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-
-                if page_link is None:
-                    all_pages_text: list[str] = []
-                    for link in await page.query_selector_all("a.row-title"):
-                        text = (await link.text_content() or "").strip()
-                        all_pages_text.append(text)
-                    pages_summary = (
-                        ", ".join(all_pages_text[:10]) if all_pages_text else "No items"
-                    )
-                    if len(all_pages_text) > 10:
-                        pages_summary += f", and {len(all_pages_text) - 10} more..."
-                    self.logger.add_log(
-                        "❌ Content not found",
-                        "error",
-                        f"slug={page_slug!r} | {pages_summary}",
-                    )
-                    screenshot_path = (
-                        f"{SCREENSHOTS_DIR}/page_not_found_title_"
-                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                    )
-                    await page.screenshot(path=screenshot_path)
-                    self.logger.add_screenshot(screenshot_path)
-                    return {
-                        "status": "failed",
-                        "error": (
-                            f"Content for slug '{page_slug}' not found in WordPress "
-                            f"pages or posts lists. Available (last list): {pages_summary}"
-                        ),
-                        "logs": self.logger.get_logs(),
-                        "screenshots": self.logger.get_screenshots(),
-                    }
-
-                self.logger.add_log(
-                    "✅ Matched list row; opening editor",
-                    "success",
-                    page_slug,
-                )
-                try:
-                    await page_link.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
-                except Exception:
-                    pass
-                await page_link.click(timeout=15000)
-                await page.wait_for_timeout(800 if light_mode else 1500)
-
-            if not light_mode:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/08_page_editor_title_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-
-            self.logger.add_log("✅ Editor loaded; filling SEO title", "success", "")
+            if prep_err:
+                return prep_err
 
             filled = await self._fill_seo_meta_title(page, meta_title)
             if not filled:
@@ -1411,151 +1334,3 @@ class WordPressPlaywright:
                 "logs": self.logger.get_logs(),
                 "screenshots": self.logger.get_screenshots(),
             }
-
-
-async def run_playwright_automation(
-    admin_url: str,
-    username: str,
-    password: str,
-    tasks: list[dict[str, Any]],
-    headless: bool | None = None
-) -> dict[str, Any]:
-    """
-    Run Playwright automation with a list of tasks with comprehensive error handling.
-    
-    Intelligently selects headed or headless mode based on environment:
-    - Windows/macOS: Headed mode (native GUI available)
-    - Linux with X server: Headed mode (DISPLAY environment variable set)
-    - Linux without X server: Headless mode (fallback for CI/Docker)
-    
-    Browser window displays all automation steps in real-time for user visibility.
-    In headless mode, detailed logs are captured and screenshots are saved.
-    
-    Args:
-        admin_url: WordPress admin URL
-        username: WordPress username
-        password: WordPress password
-        tasks: List of task dicts with "type", "from_slug"/"page_url", "to_url"/"meta_description"
-        headless: Run browser in headless mode (None=auto-detect based on environment)
-    
-    Returns:
-        Results with logs and screenshots
-    """
-    if headless is None:
-        headless = should_run_headless()
-        logger.info(f"Auto-detected headless mode: {headless} (Display available: {is_display_available()})")
-    
-    async with async_playwright() as p:
-        browser = await launch_chromium(p, headless=headless)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 1024},
-            ignore_https_errors=True,
-            extra_http_headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-        )
-        page = await context.new_page()
-        
-        page.set_default_timeout(90000)
-        page.set_default_navigation_timeout(90000)
-        
-        wp = WordPressPlaywright(admin_url, username, password)
-        
-        wp.logger.add_log(
-            "━" * 80,
-            "info",
-            "Starting WordPress automation"
-        )
-        
-        try:
-            if not await wp.login(page):
-                wp.logger.add_log(
-                    "━" * 80,
-                    "error",
-                    "AUTOMATION FAILED: Login unsuccessful"
-                )
-                return {
-                    "status": "failed",
-                    "error": "Could not log in to WordPress",
-                    "logs": wp.logger.get_logs(),
-                    "screenshots": wp.logger.get_screenshots()
-                }
-            
-            results = []
-            
-            for i, task in enumerate(tasks):
-                task_type = task.get("type")
-                
-                wp.logger.add_log(
-                    f"Task {i + 1}/{len(tasks)}",
-                    "info",
-                    f"Type: {task_type}"
-                )
-                
-                if task_type == "redirect":
-                    result = await wp.create_301_redirect(
-                        task["from_slug"],
-                        task["to_url"],
-                        page
-                    )
-                elif task_type == "meta_description":
-                    raw_pid = task.get("post_id")
-                    post_id = int(raw_pid) if raw_pid is not None else None
-                    result = await wp.update_meta_description(
-                        task["page_url"],
-                        task["meta_description"],
-                        page,
-                        post_id=post_id,
-                    )
-                elif task_type == "meta_title":
-                    raw_pid = task.get("post_id")
-                    post_id = int(raw_pid) if raw_pid is not None else None
-                    result = await wp.update_meta_title(
-                        task["page_url"],
-                        task["meta_title"],
-                        page,
-                        post_id=post_id,
-                    )
-                else:
-                    result = {"status": "failed", "error": f"Unknown task type: {task_type}"}
-                
-                results.append(result)
-                
-                await page.wait_for_timeout(500)
-            
-            successful = sum(1 for r in results if r.get("status") in ["created", "updated"])
-            failed = sum(1 for r in results if r.get("status") == "failed")
-            
-            wp.logger.add_log(
-                "━" * 80,
-                "success" if failed == 0 else "warning",
-                f"Automation complete: {successful} successful, {failed} failed"
-            )
-            
-            return {
-                "status": "completed",
-                "total_tasks": len(tasks),
-                "successful": successful,
-                "failed": failed,
-                "results": results,
-                "logs": wp.logger.get_logs(),
-                "screenshots": wp.logger.get_screenshots()
-            }
-        
-        except Exception as e:
-            wp.logger.add_log(
-                "━" * 80,
-                "error",
-                f"EXCEPTION: {str(e)}"
-            )
-            logger.error(f"Playwright automation failed: {e}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "logs": wp.logger.get_logs(),
-                "screenshots": wp.logger.get_screenshots()
-            }
-        
-        finally:
-            await context.close()
-            await browser.close()

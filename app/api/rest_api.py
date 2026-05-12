@@ -7,7 +7,7 @@ import logging
 import time
 from fastapi import APIRouter, HTTPException
 
-from app.services.wp_rest_api import WordPressRESTClient, TaskType, RedirectSource
+from app.services.wp_rest import WordPressRESTClient, RedirectSource, TaskType
 from app.schemas.rest_api import (
     DryRunResponse,
     OperationResponse,
@@ -49,7 +49,7 @@ def _get_client(site_url: str, username: str, app_password: str) -> WordPressRES
 def dry_run_update_title(body: UpdateTitleDryRunRequest) -> DryRunResponse:
     """Dry-run for updating post title."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.update_post_title(body.post_id, body.new_title)
         return DryRunResponse(**result.to_dict())
     except HTTPException:
@@ -63,7 +63,7 @@ def dry_run_update_title(body: UpdateTitleDryRunRequest) -> DryRunResponse:
 def execute_update_title(body: UpdateTitleExecuteRequest) -> OperationResponse:
     """Execute post title update."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.apply_update_post_title(body.post_id, body.new_title)
         return OperationResponse(**result.to_dict())
     except HTTPException:
@@ -82,7 +82,7 @@ def execute_update_title(body: UpdateTitleExecuteRequest) -> OperationResponse:
 def dry_run_update_content(body: UpdateContentDryRunRequest) -> DryRunResponse:
     """Dry-run for updating post content."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.update_post_content(body.post_id, body.new_content)
         return DryRunResponse(**result.to_dict())
     except HTTPException:
@@ -96,7 +96,7 @@ def dry_run_update_content(body: UpdateContentDryRunRequest) -> DryRunResponse:
 def execute_update_content(body: UpdateContentExecuteRequest) -> OperationResponse:
     """Execute post content update."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.apply_update_post_content(body.post_id, body.new_content)
         return OperationResponse(**result.to_dict())
     except HTTPException:
@@ -115,7 +115,7 @@ def execute_update_content(body: UpdateContentExecuteRequest) -> OperationRespon
 def dry_run_update_alt_text(body: UpdateAltTextDryRunRequest) -> DryRunResponse:
     """Dry-run for updating image alt text."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.update_image_alt_text(body.media_id, body.alt_text)
         return DryRunResponse(**result.to_dict())
     except HTTPException:
@@ -129,7 +129,7 @@ def dry_run_update_alt_text(body: UpdateAltTextDryRunRequest) -> DryRunResponse:
 def execute_update_alt_text(body: UpdateAltTextExecuteRequest) -> OperationResponse:
     """Execute image alt text update."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.apply_update_image_alt_text(body.media_id, body.alt_text)
         return OperationResponse(**result.to_dict())
     except HTTPException:
@@ -148,7 +148,7 @@ def execute_update_alt_text(body: UpdateAltTextExecuteRequest) -> OperationRespo
 def dry_run_cleanup_urls(body: CleanupUrlsDryRunRequest) -> DryRunResponse:
     """Dry-run for cleaning up URLs in post content."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.cleanup_urls_in_post(body.post_id, body.replacements)
         return DryRunResponse(**result.to_dict())
     except HTTPException:
@@ -162,7 +162,7 @@ def dry_run_cleanup_urls(body: CleanupUrlsDryRunRequest) -> DryRunResponse:
 def execute_cleanup_urls(body: CleanupUrlsExecuteRequest) -> OperationResponse:
     """Execute URL cleanup in post content."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.apply_cleanup_urls_in_post(body.post_id, body.replacements)
         return OperationResponse(**result.to_dict())
     except HTTPException:
@@ -181,7 +181,7 @@ def execute_cleanup_urls(body: CleanupUrlsExecuteRequest) -> OperationResponse:
 def dry_run_create_redirect(body: CreateRedirectDryRunRequest) -> DryRunResponse:
     """Dry-run for creating a 301 redirect."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
         result = client.create_redirect_dry_run(
             body.source_url, body.target_url, body.plugin
         )
@@ -197,7 +197,7 @@ def dry_run_create_redirect(body: CreateRedirectDryRunRequest) -> DryRunResponse
 def execute_create_redirect(body: CreateRedirectExecuteRequest) -> OperationResponse:
     """Execute redirect creation."""
     try:
-        client = _get_client(body.site_url, body.username, body.app_password)
+        client = _get_client(body.site_url, body.username, body.app_password.get_secret_value())
 
         if body.plugin == RedirectSource.REDIRECTION_PLUGIN:
             result = client.apply_create_redirect_redirection_plugin(
@@ -238,7 +238,7 @@ def execute_batch_operations(body: BatchOperationRequest) -> BatchOperationRespo
         try:
             logger.info(f"Processing operation {i+1}/{len(body.operations)}: {op.task_type}")
 
-            client = _get_client(op.site_url, op.app_password)
+            client = _get_client(op.site_url, op.username, op.app_password.get_secret_value())
 
             if isinstance(op, UpdateTitleExecuteRequest):
                 result = client.apply_update_post_title(op.post_id, op.new_title)
@@ -253,9 +253,14 @@ def execute_batch_operations(body: BatchOperationRequest) -> BatchOperationRespo
                     result = client.apply_create_redirect_redirection_plugin(
                         op.source_url, op.target_url
                     )
-                else:
+                elif op.plugin == RedirectSource.RANK_MATH:
                     result = client.apply_create_redirect_rank_math(
                         op.source_url, op.target_url
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported redirect plugin: {op.plugin}",
                     )
             else:
                 raise ValueError(f"Unknown operation type: {type(op)}")
@@ -271,6 +276,8 @@ def execute_batch_operations(body: BatchOperationRequest) -> BatchOperationRespo
                     logger.warning(f"Stopping batch at operation {i+1} due to error")
                     break
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Operation {i+1} failed: {e}")
             operations.append(
