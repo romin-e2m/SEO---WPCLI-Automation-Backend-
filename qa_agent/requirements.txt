@@ -1,8 +1,0 @@
-# Core runtime dependencies
-# Pinned versions tested on Python 3.11.
-# On Python 3.12+ use: pip install httpx pydantic python-dotenv beautifulsoup4 lxml rich
-httpx>=0.26.0
-pydantic>=2.9.0
-python-dotenv>=1.0.1
-beautifulsoup4>=4.12.3
-rich>=13.9.4

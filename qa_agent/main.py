@@ -5,7 +5,7 @@ Usage:
   python main.py --execute-response execute_result.json --site https://mysite.com \\
                  --user admin --password "xxxx yyyy zzzz"
 
-  python main.py --execute-response execute_result.json   # uses .env for site creds
+  python main.py --execute-response execute_result.json   # uses .env from backend root
 
   python main.py --help
 """
@@ -55,19 +55,19 @@ Examples:
         "--site",
         metavar="URL",
         default=None,
-        help="WordPress site root URL (overrides WP_REST_BASE_URL in .env).",
+        help="WordPress site root URL (overrides WP_REST_BASE_URL in backend .env).",
     )
     parser.add_argument(
         "--user",
         metavar="USERNAME",
         default=None,
-        help="WordPress username (overrides WP_USERNAME in .env).",
+        help="WordPress username (overrides WP_USERNAME in backend .env).",
     )
     parser.add_argument(
         "--password",
         metavar="APP_PASSWORD",
         default=None,
-        help="WordPress Application Password (overrides WP_APP_PASSWORD in .env).",
+        help="WordPress Application Password (overrides WP_APP_PASSWORD in backend .env).",
     )
     parser.add_argument(
         "--output",
@@ -107,7 +107,7 @@ def _resolve_credentials(args: argparse.Namespace) -> tuple[str, str, str]:
     if missing:
         print(
             f"[ERROR] Missing required credentials: {', '.join(missing)}\n"
-            "Provide them via CLI flags or a .env file.",
+            "Provide them via CLI flags or set in backend .env file.",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -1,7 +1,15 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from backend root directory (parent of qa_agent)
+backend_root = Path(__file__).parent.parent
+env_file = backend_root / ".env"
+
+if env_file.exists():
+    load_dotenv(env_file)
+else:
+    load_dotenv()
 
 # OpenRouter OR Anthropic
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")

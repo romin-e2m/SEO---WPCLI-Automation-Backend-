@@ -43,7 +43,7 @@ class WorkbookAnalyzeResponse(BaseModel):
 class WorkbookAnalyzeUrlRequest(BaseModel):
     url: HttpUrl = Field(description="Publicly accessible spreadsheet URL.")
     site_url: str | None = Field(default=None)
-    preview_rows: int = Field(default=10, ge=1, le=100)
+    preview_rows: int = Field(default=10, ge=1)
 
 
 class SheetMapping(BaseModel):
