@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 from app.schemas.schema import (
     ActionSchema,
-    AnyOfGroup,
-    FieldDefinition,
     CreateActionSchemaRequest,
     UpdateActionSchemaRequest,
 )
+
+from app.services.builtin_action_definitions import builtin_action_schemas
 
 logger = logging.getLogger(__name__)
 
@@ -35,96 +35,7 @@ class SchemaManager:
 
     def _load_builtin_schemas(self) -> None:
         """Load system built-in schemas."""
-        builtin = [
-            ActionSchema(
-                id="on_page",
-                label="On-Page (H1)",
-                description="Manage page H1 tags",
-                fields=[
-                    FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
-                    FieldDefinition(key="current_h1", label="Current H1", type="text"),
-                    FieldDefinition(key="recommended_h1", label="Recommended H1", type="text"),
-                    FieldDefinition(key="notes", label="Notes", type="text"),
-                ],
-                any_of_groups=[
-                    AnyOfGroup(fields=["recommended_h1"])
-                ],
-                created_at=datetime.now(timezone.utc).isoformat(),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                is_system=True,
-            ),
-            ActionSchema(
-                id="meta",
-                label="Meta description",
-                description="Update meta descriptions for pages",
-                fields=[
-                    FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
-                    FieldDefinition(key="current_meta_description", label="Current meta description", type="text"),
-                    FieldDefinition(key="recommended_meta_description", label="Recommended meta description", required=True, type="text"),
-                    FieldDefinition(key="notes", label="Notes", type="text"),
-                ],
-                created_at=datetime.now(timezone.utc).isoformat(),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                is_system=True,
-            ),
-            ActionSchema(
-                id="meta_title",
-                label="SEO meta title",
-                description="Update SEO title (search snippet title) for pages and posts",
-                fields=[
-                    FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
-                    FieldDefinition(key="current_meta_title", label="Current meta title", type="text"),
-                    FieldDefinition(key="recommended_meta_title", label="Recommended meta title", required=True, type="text"),
-                    FieldDefinition(key="notes", label="Notes", type="text"),
-                ],
-                created_at=datetime.now(timezone.utc).isoformat(),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                is_system=True,
-            ),
-            ActionSchema(
-                id="images",
-                label="Image alt text",
-                description="Add or update image alt text",
-                fields=[
-                    FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
-                    FieldDefinition(key="image_url", label="Image URL", required=True, type="url"),
-                    FieldDefinition(key="current_alt_text", label="Current alt text", type="text"),
-                    FieldDefinition(key="recommended_alt_text", label="Recommended alt text", required=True, type="text"),
-                    FieldDefinition(key="notes", label="Notes", type="text"),
-                ],
-                created_at=datetime.now(timezone.utc).isoformat(),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                is_system=True,
-            ),
-            ActionSchema(
-                id="url_cleanup",
-                label="URL cleanup in content",
-                description="Replace old URLs with new ones in content",
-                fields=[
-                    FieldDefinition(key="page_url", label="Page URL", required=True, type="url"),
-                    FieldDefinition(key="old_url", label="URL to replace", required=True, type="url"),
-                    FieldDefinition(key="new_url", label="New URL", required=True, type="url"),
-                    FieldDefinition(key="notes", label="Notes", type="text"),
-                ],
-                created_at=datetime.now(timezone.utc).isoformat(),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                is_system=True,
-            ),
-            ActionSchema(
-                id="redirects_301",
-                label="301 Redirects",
-                description="Create permanent redirects between URLs",
-                fields=[
-                    FieldDefinition(key="source_url", label="Source (from) URL", required=True, type="url"),
-                    FieldDefinition(key="target_url", label="Destination (to) URL", required=True, type="url"),
-                    FieldDefinition(key="notes", label="Notes", type="text"),
-                ],
-                created_at=datetime.now(timezone.utc).isoformat(),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-                is_system=True,
-            ),
-        ]
-        for schema in builtin:
+        for schema in builtin_action_schemas():
             self._schemas[schema.id] = schema
 
     def _load_from_file(self) -> None:

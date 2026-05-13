@@ -1,7 +1,9 @@
 import os
 import json
 import asyncio
+import platform
 import socket
+import sys
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -61,8 +63,6 @@ def _get_environment_details():
 
         # Check PostgreSQL
         try:
-            import socket
-
             db_host = os.getenv("DB_HOST", "localhost")
             db_port = int(os.getenv("DB_PORT", "5432"))
 
@@ -87,16 +87,12 @@ def _get_environment_details():
 
         # Get OS info
         try:
-            import platform
-
             details.append(f"OS: {platform.system()} {platform.release()[:10]}")
         except Exception:
             pass
 
         # Get Python version
         try:
-            import sys
-
             details.append(f"Python: {sys.version.split()[0]}")
         except Exception:
             pass
@@ -157,7 +153,8 @@ async def _stream_generator(execution_id: str):
     for _ in range(max_iterations):
         if execution_id in _execution_logs_store:
             logs = _execution_logs_store[execution_id]
-            if len(logs) < last_index:
+            # Logs can be replaced with a fresh list (see clear_execution_logs); keep cursor valid.
+            if last_index > len(logs):
                 last_index = 0
             if len(logs) > last_index:
                 for log in logs[last_index:]:

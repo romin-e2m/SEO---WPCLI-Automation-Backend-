@@ -8,6 +8,7 @@ from app.schemas.workbook import (
     MappingNormalizeUrlRequest,
     MappingValidateResponse,
     MappingValidateUrlRequest,
+    SheetMapping,
     SheetPreview,
     WorkbookAnalyzeResponse,
     WorkbookAnalyzeUrlRequest,
@@ -33,6 +34,16 @@ from app.services.dynamic_mapping import (
 router = APIRouter(prefix="/api/workbook", tags=["workbook"])
 
 _DEFAULT_MAX_BYTES = 20 * 1024 * 1024
+
+
+async def _download_workbook_full_for_mappings(
+    url: str, mappings: list[SheetMapping]
+) -> tuple[str, dict[str, Any]]:
+    """Download spreadsheet and read full data for the sheets referenced by mappings."""
+    body, filename = await download_spreadsheet_from_url(str(url))
+    wanted = sorted({m.sheet_name for m in mappings if m.enabled})
+    full = read_full_sheets(body, filename, sheet_names=wanted or None)
+    return filename, full
 
 
 def _max_upload_bytes() -> int:
@@ -162,9 +173,9 @@ def mapping_descriptor() -> dict[str, Any]:
 async def validate_mapping_url(payload: MappingValidateUrlRequest) -> MappingValidateResponse:
     cleaned_site = (payload.site_url or "").strip() or None
     try:
-        body, filename = await download_spreadsheet_from_url(str(payload.url))
-        wanted = sorted({m.sheet_name for m in payload.mappings if m.enabled})
-        full = read_full_sheets(body, filename, sheet_names=wanted or None)
+        filename, full = await _download_workbook_full_for_mappings(
+            str(payload.url), payload.mappings
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -188,9 +199,9 @@ async def validate_mapping_url(payload: MappingValidateUrlRequest) -> MappingVal
 async def normalize_mapping_url(payload: MappingNormalizeUrlRequest) -> MappingNormalizeResponse:
     cleaned_site = (payload.site_url or "").strip() or None
     try:
-        body, filename = await download_spreadsheet_from_url(str(payload.url))
-        wanted = sorted({m.sheet_name for m in payload.mappings if m.enabled})
-        full = read_full_sheets(body, filename, sheet_names=wanted or None)
+        filename, full = await _download_workbook_full_for_mappings(
+            str(payload.url), payload.mappings
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -217,9 +228,9 @@ async def validate_mapping_dynamic_url(payload: MappingValidateUrlRequest, reque
     manager = request.app.schema_manager
     
     try:
-        body, filename = await download_spreadsheet_from_url(str(payload.url))
-        wanted = sorted({m.sheet_name for m in payload.mappings if m.enabled})
-        full = read_full_sheets(body, filename, sheet_names=wanted or None)
+        filename, full = await _download_workbook_full_for_mappings(
+            str(payload.url), payload.mappings
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -252,9 +263,9 @@ async def normalize_mapping_dynamic_url(payload: MappingNormalizeUrlRequest, req
     manager = request.app.schema_manager
     
     try:
-        body, filename = await download_spreadsheet_from_url(str(payload.url))
-        wanted = sorted({m.sheet_name for m in payload.mappings if m.enabled})
-        full = read_full_sheets(body, filename, sheet_names=wanted or None)
+        filename, full = await _download_workbook_full_for_mappings(
+            str(payload.url), payload.mappings
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

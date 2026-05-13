@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable
+from typing import Any, cast
 
 from app.schemas.workbook import (
     ActionType,
@@ -23,70 +23,12 @@ from app.services.mapping_common import (
 # canonical_field -> {required: bool, type: 'url'|'text'|'int'}
 # action_type -> ordered list of canonical fields with metadata.
 # `any_of_groups` lets us require "at least one of" for actions like on_page.
-ACTION_FIELDS: dict[ActionType, dict[str, Any]] = {
-    "on_page": {
-        "label": "On-Page (H1)",
-        "fields": [
-            {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
-            {"key": "current_h1", "label": "Current H1", "required": False, "type": "text"},
-            {"key": "recommended_h1", "label": "Recommended H1", "required": False, "type": "text"},
-            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
-        ],
-        "any_of_groups": [
-            ["recommended_h1"],
-        ],
-    },
-    "meta": {
-        "label": "Meta description",
-        "fields": [
-            {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
-            {"key": "current_meta_description", "label": "Current meta description", "required": False, "type": "text"},
-            {"key": "recommended_meta_description", "label": "Recommended meta description", "required": True, "type": "text"},
-            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
-        ],
-        "any_of_groups": [],
-    },
-    "meta_title": {
-        "label": "SEO meta title",
-        "fields": [
-            {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
-            {"key": "current_meta_title", "label": "Current meta title", "required": False, "type": "text"},
-            {"key": "recommended_meta_title", "label": "Recommended meta title", "required": True, "type": "text"},
-            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
-        ],
-        "any_of_groups": [],
-    },
-    "images": {
-        "label": "Image alt text",
-        "fields": [
-            {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
-            {"key": "image_url", "label": "Image URL", "required": True, "type": "url"},
-            {"key": "current_alt_text", "label": "Current alt text", "required": False, "type": "text"},
-            {"key": "recommended_alt_text", "label": "Recommended alt text", "required": True, "type": "text"},
-            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
-        ],
-        "any_of_groups": [],
-    },
-    "url_cleanup": {
-        "label": "URL cleanup in content",
-        "fields": [
-            {"key": "page_url", "label": "Page URL", "required": True, "type": "url"},
-            {"key": "old_url", "label": "URL to replace", "required": True, "type": "url"},
-            {"key": "new_url", "label": "New URL", "required": True, "type": "url"},
-            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
-        ],
-        "any_of_groups": [],
-    },
-    "redirects_301": {
-        "label": "301 Redirects",
-        "fields": [
-            {"key": "source_url", "label": "Source (from) URL", "required": True, "type": "url"},
-            {"key": "target_url", "label": "Destination (to) URL", "required": True, "type": "url"},
-            {"key": "notes", "label": "Notes", "required": False, "type": "text"},
-        ],
-        "any_of_groups": [],
-    },
-}
+from app.services.builtin_action_definitions import build_action_fields_dict
+
+ACTION_FIELDS: dict[ActionType, dict[str, Any]] = cast(
+    dict[ActionType, dict[str, Any]],
+    build_action_fields_dict(),
+)
 
 
 # canonical_field -> list of header aliases (lower-cased, normalized).
@@ -516,7 +458,3 @@ def action_fields_descriptor() -> dict[str, Any]:
         }
         for action, spec in ACTION_FIELDS.items()
     }
-
-
-def column_aliases_for(canonical: str) -> Iterable[str]:
-    return HEADER_ALIASES.get(canonical, [])

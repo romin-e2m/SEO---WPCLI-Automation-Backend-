@@ -425,15 +425,6 @@ def analyze_spreadsheet_bytes(
     raise ValueError(f"Unsupported file type {suffix or '(none)'}. Use .xlsx, .xls, or .csv.")
 
 
-def analyze_xlsx_bytes(
-    content: bytes,
-    *,
-    preview_rows: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Backward-compatible entry for tests; prefer analyze_spreadsheet_bytes."""
-    return _analyze_xlsx_bytes(content, preview_rows=preview_rows)
-
-
 _DEFAULT_MAX_FULL_ROWS = 100_000
 
 

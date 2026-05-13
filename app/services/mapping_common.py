@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -14,8 +15,6 @@ def coerce_str(v: Any) -> str:
         return ""
     if isinstance(v, float):
         try:
-            import math
-
             if math.isnan(v) or math.isinf(v):
                 return ""
         except Exception:

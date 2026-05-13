@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit, urlparse
 
 import httpx
 
@@ -29,6 +29,102 @@ def _meta_plugin_keys_from_seo_selection(seo_plugin: str | None) -> set[str] | N
     if "seopress" in s:
         keys.add("seopress")
     return keys if keys else None
+
+
+@dataclass(frozen=True)
+class _SeoMetaRestProfile:
+    """Shared REST update behaviour for meta description vs SEO title."""
+
+    field_configs: tuple[dict[str, Any], ...]
+    success_log_fmt: str
+    debug_fail_fmt: str
+    debug_fail_private_fmt: str
+    warn_no_plugin: str
+    warn_all_failed: str
+
+
+_SEO_META_DESC_PROFILE = _SeoMetaRestProfile(
+    field_configs=(
+        {
+            "key": "rank_math_description",
+            "plugin": "rank_math",
+            "name": "Rank Math",
+            "priority": 1,
+            "rest_safe": True,
+        },
+        {
+            "key": "_yoast_wpseo_metadesc",
+            "plugin": "yoast",
+            "name": "Yoast SEO",
+            "priority": 2,
+            "rest_safe": False,
+        },
+        {
+            "key": "_rank_math_description",
+            "plugin": "rank_math",
+            "name": "Rank Math",
+            "priority": 2,
+            "rest_safe": False,
+        },
+        {
+            "key": "_seopress_titles_desc",
+            "plugin": "seopress",
+            "name": "SEOPress",
+            "priority": 3,
+            "rest_safe": False,
+        },
+    ),
+    success_log_fmt="Updated post {post_id} meta via REST API: {plugin_name} ({meta_key})",
+    debug_fail_fmt="REST API attempt for {plugin_name} failed: {exc}",
+    debug_fail_private_fmt="REST API attempt for {plugin_name} failed: {exc}",
+    warn_no_plugin="No SEO plugin detected on post {post_id}. Meta description cannot be updated.",
+    warn_all_failed=(
+        "REST API meta update for post {post_id} failed for all {detected} fields. "
+        "This is likely due to REST API permission restrictions on private meta fields. "
+        "Using WP-CLI would succeed, but REST API access is currently being used."
+    ),
+)
+
+_SEO_META_TITLE_PROFILE = _SeoMetaRestProfile(
+    field_configs=(
+        {
+            "key": "rank_math_title",
+            "plugin": "rank_math",
+            "name": "Rank Math",
+            "priority": 1,
+            "rest_safe": True,
+        },
+        {
+            "key": "_yoast_wpseo_title",
+            "plugin": "yoast",
+            "name": "Yoast SEO",
+            "priority": 2,
+            "rest_safe": False,
+        },
+        {
+            "key": "_rank_math_title",
+            "plugin": "rank_math",
+            "name": "Rank Math",
+            "priority": 2,
+            "rest_safe": False,
+        },
+        {
+            "key": "_seopress_titles_title",
+            "plugin": "seopress",
+            "name": "SEOPress",
+            "priority": 3,
+            "rest_safe": False,
+        },
+    ),
+    success_log_fmt="Updated post {post_id} SEO title via REST API: {plugin_name} ({meta_key})",
+    debug_fail_fmt="REST API SEO title attempt for {plugin_name} failed: {exc}",
+    debug_fail_private_fmt="REST API SEO title attempt for {plugin_name} failed: {exc}",
+    warn_no_plugin="No SEO plugin detected on post {post_id}. SEO title cannot be updated.",
+    warn_all_failed=(
+        "REST API SEO title update for post {post_id} failed for all {detected} fields. "
+        "This is likely due to REST API permission restrictions on private meta fields."
+    ),
+)
 
 
 def _redirect_rest_backends(preferred_plugin: str | None) -> list[str]:
@@ -474,6 +570,124 @@ class WpRestClient:
             
             return result
     
+    def _update_seo_meta_field(
+        self,
+        post_id: int,
+        value: str,
+        *,
+        seo_plugin: str | None,
+        profile: _SeoMetaRestProfile,
+    ) -> dict[str, Any]:
+        if not value:
+            return self.get_post(post_id)
+        try:
+            post_obj = self.get_post(post_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch post {post_id}: {str(e)}")
+            raise
+
+        active_plugins = self.detect_active_plugins()
+        selected_keys = _meta_plugin_keys_from_seo_selection(seo_plugin)
+        meta_field_configs = list(profile.field_configs)
+
+        if selected_keys:
+            active_configs = [cfg for cfg in meta_field_configs if cfg["plugin"] in selected_keys]
+        else:
+            active_configs = [
+                cfg for cfg in meta_field_configs
+                if active_plugins.get(cfg["plugin"], False)
+            ]
+        active_configs.sort(key=lambda x: x["priority"])
+
+        if not active_configs:
+            active_configs = [
+                cfg for cfg in meta_field_configs
+                if active_plugins.get(cfg["plugin"], False)
+            ]
+            active_configs.sort(key=lambda x: x["priority"])
+
+        rest_safe_configs = [cfg for cfg in active_configs if cfg["rest_safe"]]
+        rest_unsafe_configs = [cfg for cfg in active_configs if not cfg["rest_safe"]]
+
+        with self._client() as c:
+            for config in rest_safe_configs:
+                try:
+                    meta_key = config["key"]
+                    plugin_name = config["name"]
+                    payload = {"meta": {meta_key: value}}
+                    params = {"context": "edit"}
+                    r = c.put(f"/posts/{post_id}", json=payload, params=params)
+                    if r.status_code == 404:
+                        r = c.put(f"/pages/{post_id}", json=payload, params=params)
+                    if r.status_code < 400:
+                        result = r.json()
+                        logger.info(
+                            profile.success_log_fmt.format(
+                                post_id=post_id,
+                                plugin_name=plugin_name,
+                                meta_key=meta_key,
+                            )
+                        )
+                        return result
+                    if r.status_code == 403:
+                        logger.debug(f"{plugin_name} ({meta_key}): 403 Forbidden")
+                except Exception as e:
+                    logger.debug(
+                        profile.debug_fail_fmt.format(
+                            plugin_name=config["name"],
+                            exc=type(e).__name__,
+                        )
+                    )
+                    continue
+
+            for config in rest_unsafe_configs:
+                try:
+                    meta_key = config["key"]
+                    plugin_name = config["name"]
+                    payload = {"meta": {meta_key: value}}
+                    params = {"context": "edit"}
+                    r = c.put(f"/posts/{post_id}", json=payload, params=params)
+                    if r.status_code == 404:
+                        r = c.put(f"/pages/{post_id}", json=payload, params=params)
+                    if r.status_code < 400:
+                        result = r.json()
+                        logger.info(
+                            profile.success_log_fmt.format(
+                                post_id=post_id,
+                                plugin_name=plugin_name,
+                                meta_key=meta_key,
+                            )
+                        )
+                        return result
+                    if r.status_code == 403:
+                        logger.debug(
+                            f"{plugin_name} ({meta_key}): 403 Forbidden (expected for private meta)"
+                        )
+                except Exception as e:
+                    logger.debug(
+                        profile.debug_fail_private_fmt.format(
+                            plugin_name=config["name"],
+                            exc=type(e).__name__,
+                        )
+                    )
+                    continue
+
+            detected_seo_plugins = ", ".join(
+                k.replace("_", " ").title()
+                for k, v in active_plugins.items()
+                if v and k in ["yoast", "rank_math", "seopress"]
+            )
+            if not detected_seo_plugins:
+                logger.warning(profile.warn_no_plugin.format(post_id=post_id))
+                return post_obj
+
+            logger.warning(
+                profile.warn_all_failed.format(
+                    post_id=post_id, detected=detected_seo_plugins
+                )
+            )
+            return post_obj
+
     def update_seo_meta_description(
         self,
         post_id: int,
@@ -487,150 +701,22 @@ class WpRestClient:
 
         When ``seo_plugin`` is set (REST `/wp/v2/plugins` file slug from the Run panel), only
         that plugin's meta keys are attempted; otherwise active plugins are auto-detected.
-        
+
         IMPORTANT: Due to REST API restrictions on private meta fields (starting with _),
         direct meta updates may fail even with proper authentication and context=edit.
         This method tries REST API but returns clear status for fallback to WP-CLI.
-        
+
         Supported plugins:
         - Yoast SEO (_yoast_wpseo_metadesc) - May require WP-CLI due to meta restrictions
         - Rank Math (rank_math_description) - Better REST API support
         - SEOPress (_seopress_titles_desc) - May require WP-CLI
         """
-        if not meta_description:
-            return self.get_post(post_id)
-        
-        # Get the post to verify it exists
-        try:
-            post_obj = self.get_post(post_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch post {post_id}: {str(e)}")
-            raise
-        
-        # Detect active SEO plugins (yoast, rank_math, seopress)
-        active_plugins = self.detect_active_plugins()
-
-        selected_keys = _meta_plugin_keys_from_seo_selection(seo_plugin)
-
-        # Meta field configurations with plugin priority and REST API restrictions
-        meta_field_configs = [
-            {
-                "key": "rank_math_description",
-                "plugin": "rank_math",
-                "name": "Rank Math",
-                "priority": 1,
-                "rest_safe": True,  # Rank Math exposes this field properly
-            },
-            {
-                "key": "_yoast_wpseo_metadesc",
-                "plugin": "yoast",
-                "name": "Yoast SEO",
-                "priority": 2,
-                "rest_safe": False,  # Private meta - may be restricted
-            },
-            {
-                "key": "_rank_math_description",
-                "plugin": "rank_math",
-                "name": "Rank Math",
-                "priority": 2,
-                "rest_safe": False,  # Alternative Rank Math field
-            },
-            {
-                "key": "_seopress_titles_desc",
-                "plugin": "seopress",
-                "name": "SEOPress",
-                "priority": 3,
-                "rest_safe": False,  # Private meta - may be restricted
-            },
-        ]
-
-        if selected_keys:
-            active_configs = [cfg for cfg in meta_field_configs if cfg["plugin"] in selected_keys]
-        else:
-            active_configs = [
-                cfg for cfg in meta_field_configs
-                if active_plugins.get(cfg["plugin"], False)
-            ]
-        active_configs.sort(key=lambda x: x["priority"])
-
-        if not active_configs:
-            active_configs = [
-                cfg for cfg in meta_field_configs
-                if active_plugins.get(cfg["plugin"], False)
-            ]
-            active_configs.sort(key=lambda x: x["priority"])
-        
-        # Try REST API first for safe fields
-        rest_safe_configs = [cfg for cfg in active_configs if cfg["rest_safe"]]
-        rest_unsafe_configs = [cfg for cfg in active_configs if not cfg["rest_safe"]]
-        
-        with self._client() as c:
-            # Try REST-safe fields first
-            for config in rest_safe_configs:
-                try:
-                    meta_key = config["key"]
-                    plugin_name = config["name"]
-                    
-                    payload = {"meta": {meta_key: meta_description}}
-                    params = {"context": "edit"}
-                    
-                    r = c.put(f"/posts/{post_id}", json=payload, params=params)
-                    if r.status_code == 404:
-                        r = c.put(f"/pages/{post_id}", json=payload, params=params)
-                    
-                    if r.status_code < 400:
-                        result = r.json()
-                        logger.info(f"Updated post {post_id} meta via REST API: {plugin_name} ({meta_key})")
-                        return result
-                    elif r.status_code == 403:
-                        logger.debug(f"{plugin_name} ({meta_key}): 403 Forbidden")
-                    
-                except Exception as e:
-                    logger.debug(f"REST API attempt for {config['name']} failed: {type(e).__name__}")
-                    continue
-            
-            # REST-safe fields all failed or none active - try REST-unsafe fields
-            # These likely won't work via REST API but we try anyway
-            for config in rest_unsafe_configs:
-                try:
-                    meta_key = config["key"]
-                    plugin_name = config["name"]
-                    
-                    payload = {"meta": {meta_key: meta_description}}
-                    params = {"context": "edit"}
-                    
-                    r = c.put(f"/posts/{post_id}", json=payload, params=params)
-                    if r.status_code == 404:
-                        r = c.put(f"/pages/{post_id}", json=payload, params=params)
-                    
-                    if r.status_code < 400:
-                        result = r.json()
-                        logger.info(f"Updated post {post_id} meta via REST API: {plugin_name} ({meta_key})")
-                        return result
-                    elif r.status_code == 403:
-                        logger.debug(f"{plugin_name} ({meta_key}): 403 Forbidden (expected for private meta)")
-                    
-                except Exception as e:
-                    logger.debug(f"REST API attempt for {config['name']} failed: {type(e).__name__}")
-                    continue
-            
-            # All REST attempts failed
-            detected_seo_plugins = ", ".join(
-                k.replace("_", " ").title()
-                for k, v in active_plugins.items()
-                if v and k in ["yoast", "rank_math", "seopress"]
-            )
-            
-            if not detected_seo_plugins:
-                logger.warning(f"No SEO plugin detected on post {post_id}. Meta description cannot be updated.")
-                return post_obj
-            
-            logger.warning(
-                f"REST API meta update for post {post_id} failed for all {detected_seo_plugins} fields. "
-                f"This is likely due to REST API permission restrictions on private meta fields. "
-                f"Using WP-CLI would succeed, but REST API access is currently being used."
-            )
-            return post_obj
+        return self._update_seo_meta_field(
+            post_id,
+            meta_description,
+            seo_plugin=seo_plugin,
+            profile=_SEO_META_DESC_PROFILE,
+        )
 
     def update_seo_meta_title(
         self,
@@ -643,129 +729,12 @@ class WpRestClient:
         Update SEO title (search snippet title) using plugin-specific post meta fields.
         Mirrors ``update_seo_meta_description`` for Yoast, Rank Math, and SEOPress.
         """
-        if not meta_title:
-            return self.get_post(post_id)
-
-        try:
-            post_obj = self.get_post(post_id)
-        except Exception as e:
-            logger.error(f"Failed to fetch post {post_id}: {str(e)}")
-            raise
-
-        active_plugins = self.detect_active_plugins()
-        selected_keys = _meta_plugin_keys_from_seo_selection(seo_plugin)
-
-        meta_field_configs = [
-            {
-                "key": "rank_math_title",
-                "plugin": "rank_math",
-                "name": "Rank Math",
-                "priority": 1,
-                "rest_safe": True,
-            },
-            {
-                "key": "_yoast_wpseo_title",
-                "plugin": "yoast",
-                "name": "Yoast SEO",
-                "priority": 2,
-                "rest_safe": False,
-            },
-            {
-                "key": "_rank_math_title",
-                "plugin": "rank_math",
-                "name": "Rank Math",
-                "priority": 2,
-                "rest_safe": False,
-            },
-            {
-                "key": "_seopress_titles_title",
-                "plugin": "seopress",
-                "name": "SEOPress",
-                "priority": 3,
-                "rest_safe": False,
-            },
-        ]
-
-        if selected_keys:
-            active_configs = [cfg for cfg in meta_field_configs if cfg["plugin"] in selected_keys]
-        else:
-            active_configs = [
-                cfg for cfg in meta_field_configs
-                if active_plugins.get(cfg["plugin"], False)
-            ]
-        active_configs.sort(key=lambda x: x["priority"])
-
-        if not active_configs:
-            active_configs = [
-                cfg for cfg in meta_field_configs
-                if active_plugins.get(cfg["plugin"], False)
-            ]
-            active_configs.sort(key=lambda x: x["priority"])
-
-        rest_safe_configs = [cfg for cfg in active_configs if cfg["rest_safe"]]
-        rest_unsafe_configs = [cfg for cfg in active_configs if not cfg["rest_safe"]]
-
-        with self._client() as c:
-            for config in rest_safe_configs:
-                try:
-                    meta_key = config["key"]
-                    plugin_name = config["name"]
-                    payload = {"meta": {meta_key: meta_title}}
-                    params = {"context": "edit"}
-                    r = c.put(f"/posts/{post_id}", json=payload, params=params)
-                    if r.status_code == 404:
-                        r = c.put(f"/pages/{post_id}", json=payload, params=params)
-                    if r.status_code < 400:
-                        result = r.json()
-                        logger.info(
-                            f"Updated post {post_id} SEO title via REST API: {plugin_name} ({meta_key})"
-                        )
-                        return result
-                    elif r.status_code == 403:
-                        logger.debug(f"{plugin_name} ({meta_key}): 403 Forbidden")
-                except Exception as e:
-                    logger.debug(
-                        f"REST API SEO title attempt for {config['name']} failed: {type(e).__name__}"
-                    )
-                    continue
-
-            for config in rest_unsafe_configs:
-                try:
-                    meta_key = config["key"]
-                    plugin_name = config["name"]
-                    payload = {"meta": {meta_key: meta_title}}
-                    params = {"context": "edit"}
-                    r = c.put(f"/posts/{post_id}", json=payload, params=params)
-                    if r.status_code == 404:
-                        r = c.put(f"/pages/{post_id}", json=payload, params=params)
-                    if r.status_code < 400:
-                        result = r.json()
-                        logger.info(
-                            f"Updated post {post_id} SEO title via REST API: {plugin_name} ({meta_key})"
-                        )
-                        return result
-                    elif r.status_code == 403:
-                        logger.debug(f"{plugin_name} ({meta_key}): 403 Forbidden (expected for private meta)")
-                except Exception as e:
-                    logger.debug(
-                        f"REST API SEO title attempt for {config['name']} failed: {type(e).__name__}"
-                    )
-                    continue
-
-            detected_seo_plugins = ", ".join(
-                k.replace("_", " ").title()
-                for k, v in active_plugins.items()
-                if v and k in ["yoast", "rank_math", "seopress"]
-            )
-            if not detected_seo_plugins:
-                logger.warning(f"No SEO plugin detected on post {post_id}. SEO title cannot be updated.")
-                return post_obj
-            
-            logger.warning(
-                f"REST API SEO title update for post {post_id} failed for all {detected_seo_plugins} fields. "
-                f"This is likely due to REST API permission restrictions on private meta fields."
-            )
-            return post_obj
+        return self._update_seo_meta_field(
+            post_id,
+            meta_title,
+            seo_plugin=seo_plugin,
+            profile=_SEO_META_TITLE_PROFILE,
+        )
 
     def resolve_post_by_url(
         self, url: str, *, post_type: Literal["any", "post", "page"] = "any"
@@ -832,8 +801,6 @@ class WpRestClient:
                                     return it, f"rest_search_prefix:{ep}"
 
                 # Strategy 2: Try to extract ID from URL if it's p=XXX or post=XXX
-                import re
-                from urllib.parse import urlparse, parse_qs
                 try:
                     parsed = urlparse(normalized)
                     query_params = parse_qs(parsed.query)
@@ -959,8 +926,6 @@ class WpRestClient:
 
             # Strategy 2: Search by filename/title
             try:
-                import re
-                from urllib.parse import urlparse
                 parsed = urlparse(image_url)
                 filename = parsed.path.split("/")[-1]
                 if filename and "." in filename:
@@ -1145,19 +1110,7 @@ class WpRestClient:
             "to_url": to_url,
             "message": error_msg,
         }
-    
-    def _try_eps_301_redirects(self, from_url: str, to_url: str) -> dict[str, Any] | None:
-        """
-        Handle 301 Redirects (EPS) plugin.
-        Since this plugin doesn't have a REST API, we cannot create redirects programmatically.
-        
-        This is a limitation of the 301 Redirects plugin - it's UI-only.
-        Redirects must be created manually via WordPress admin or using WP-CLI.
-        """
-        logger.warning(f"301 Redirects plugin doesn't have REST API support")
-        logger.info(f"Redirect needed (manual creation required): {from_url} → {to_url}")
-        logger.info(f"Please create this redirect in WordPress admin > Tools > 301 Redirects")
-        return None
+
 
 # --- WordPress REST SEO task client (full /wp-json base; used by /api/rest-api routes) ---
 class TaskType(str, Enum):
@@ -1669,7 +1622,7 @@ class WordPressRESTClient:
             with self._get_client() as client:
                 time.sleep(self._rate_limit_delay)
                 resp = client.post(
-                    "/rankmath/v1/redirects",
+                    "/rank-math/v1/redirects",
                     json={
                         "sources": [{"source": source_url}],
                         "destination": target_url,

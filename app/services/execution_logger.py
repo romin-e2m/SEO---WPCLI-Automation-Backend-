@@ -5,23 +5,12 @@ from dataclasses import dataclass, asdict
 
 
 @dataclass
-class ElementInfo:
-    selector: str
-    visible: bool
-    in_viewport: bool
-    x: int = 0
-    y: int = 0
-
-
-@dataclass
 class ExecutionLogEntry:
     id: str
     timestamp: str
     action: str
     status: str  # 'pending', 'success', 'error', 'warning'
     details: Optional[str] = None
-    element_info: Optional[dict] = None
-    browser_screenshot: Optional[str] = None
     execution_id: str = "default"
 
     def to_dict(self):
@@ -53,8 +42,6 @@ class ExecutionLogger:
         action: str,
         status: str = "success",
         details: Optional[str] = None,
-        element_info: Optional[ElementInfo] = None,
-        browser_screenshot: Optional[str] = None,
     ) -> None:
         """Append a log entry (safe from worker threads used by sync FastAPI routes)."""
         with self._lock:
@@ -65,8 +52,6 @@ class ExecutionLogger:
                 action=action,
                 status=status,
                 details=details,
-                element_info=asdict(element_info) if element_info else None,
-                browser_screenshot=browser_screenshot,
                 execution_id=self.execution_id,
             )
             self.logs.append(entry)
