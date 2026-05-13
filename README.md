@@ -44,6 +44,11 @@ docker run --rm -p 8013:8013 -e CORS_ALLOWED_ORIGINS=http://localhost:3013 wp-se
 - Remote download cap: `MAX_WORKBOOK_DOWNLOAD_BYTES` (default 20 MiB).
 - Full-sheet read cap (validate / normalize): `MAX_WORKBOOK_FULL_ROWS` (default 100 000 rows per sheet).
 
+### Run pipeline vs granular REST tasks
+
+- **`/api/run/*`** — Workbook batch flow (`SiteAccess` + normalized `grouped` rows). Uses the shared pipeline (`WpRestClient`): REST for posts/media/redirect attempts plus WP-CLI where configured. This is what the mapping UI drives after normalize.
+- **`/api/rest-api/*`** — Single-operation helpers (`WordPressRESTClient`): dry-run/execute per task type (title, content, alt, URL cleanup, redirects) with typed request bodies. Same underlying redirect payloads and timeouts as the pipeline; prefer one path per integration so you do not duplicate credentials logic.
+
 ### Run pipeline (resolution + dry-run + execute)
 
 - `POST /api/run/dry-run` — JSON body: `site` (`SiteAccess`: REST credentials + optional `wp_cli`), `grouped` (same `grouped` object returned by `/api/workbook/mapping/normalize`). Performs URL→post/attachment resolution against the live site, reads current title/H1/body, meta description, alt text, or content for URL replacement, and returns per-row `diffs` without writing. Meta + alt + redirects require WP-CLI as in the granular `/api/wp/*` endpoints.

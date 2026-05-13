@@ -10,23 +10,9 @@ from app.schemas.run import DryRunRequest, DryRunResponse, ExecuteRequest, Execu
 from app.services.run_pipeline import run_dry_run, run_execute
 from app.services.wp_site import rest_client
 from app.services.execution_logger import ExecutionLogger
+from app.services.execution_log_registry import get as get_execution_logger, register as register_execution
 
 router = APIRouter(prefix="/api/run", tags=["run"])
-
-_MAX_TRACKED_EXECUTIONS = 50
-
-# execution_id -> logger (completed entries pruned when over capacity)
-_active_executions: dict[str, ExecutionLogger] = {}
-
-
-def _register_execution(execution_id: str, logger: ExecutionLogger) -> None:
-    if len(_active_executions) >= _MAX_TRACKED_EXECUTIONS:
-        for eid, ex in list(_active_executions.items()):
-            if ex.is_complete():
-                _active_executions.pop(eid, None)
-            if len(_active_executions) < _MAX_TRACKED_EXECUTIONS:
-                break
-    _active_executions[execution_id] = logger
 
 
 @router.post("/dry-run", response_model=DryRunResponse)
@@ -47,9 +33,9 @@ def execute(body: ExecuteRequest) -> ExecuteResponse:
         rest_client(body.site).health_check()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"REST auth failed: {str(e)}") from e
-    execution_id = str(uuid.uuid4())
+    execution_id = body.execution_id or str(uuid.uuid4())
     execution = ExecutionLogger(execution_id)
-    _register_execution(execution_id, execution)
+    register_execution(execution_id, execution)
     try:
         result = run_execute(
             body.site,
@@ -66,7 +52,7 @@ def execute(body: ExecuteRequest) -> ExecuteResponse:
 @router.get("/status/{execution_id}")
 def get_execution_status(execution_id: str) -> dict:
     """Get current status of an execution."""
-    execution = _active_executions.get(execution_id)
+    execution = get_execution_logger(execution_id)
     if not execution:
         raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
 
@@ -79,7 +65,7 @@ def get_execution_status(execution_id: str) -> dict:
 
 async def _log_stream_generator(execution_id: str):
     """Generate server-sent events for execution logs (polls; safe with sync executor)."""
-    execution = _active_executions.get(execution_id)
+    execution = get_execution_logger(execution_id)
     if not execution:
         yield f"data: {json.dumps({'error': 'Execution not found'})}\n\n"
         return
@@ -110,7 +96,7 @@ async def _log_stream_generator(execution_id: str):
 @router.get("/stream/{execution_id}")
 async def stream_execution_logs(execution_id: str):
     """Stream execution logs in real-time via Server-Sent Events."""
-    if execution_id not in _active_executions:
+    if get_execution_logger(execution_id) is None:
         raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
 
     return StreamingResponse(

@@ -149,6 +149,46 @@ def _redirect_rest_backends(preferred_plugin: str | None) -> list[str]:
     return ["redirection", "rank_math", "safe_redirect_manager"]
 
 
+DEFAULT_WP_REST_TIMEOUT_S = 30
+DEFAULT_WP_REST_RATE_LIMIT_S = 0.5
+
+
+def _wp_json_root_base(base_url: str) -> str:
+    """REST root ``/wp-json`` for plugin namespaces (Redirection, Rank Math). Core routes use ``/wp-json/wp/v2``."""
+    return f"{_normalize_base_url(base_url)}/wp-json"
+
+
+def _redirection_plugin_create_payload(from_url: str, to_url: str) -> dict[str, Any]:
+    """Body for POST ``/redirection/v1/redirect`` (John Godley Redirection)."""
+    return {
+        "source": from_url,
+        "target": to_url,
+        "regex": False,
+        "match_type": "url",
+        "status_code": 301,
+        "group_id": 1,
+        "enabled": True,
+    }
+
+
+def _rank_math_redirect_create_payload(from_url: str, to_url: str) -> dict[str, Any]:
+    """Body for POST ``/rank-math/v1/redirects`` (Rank Math REST API)."""
+    return {
+        "sources": [{"source": from_url}],
+        "destination": to_url,
+        "type": "301",
+    }
+
+
+def _safe_redirect_manager_create_payload(from_url: str, to_url: str) -> dict[str, Any]:
+    """Body for POST under wp/v2 — use path ``/redirects`` with base ``.../wp-json/wp/v2``."""
+    return {
+        "redirect_from": from_url,
+        "redirect_to": to_url,
+        "redirect_code": "301",
+    }
+
+
 def _normalize_base_url(base_url: str) -> str:
     base_url = (base_url or "").strip()
     return base_url.rstrip("/")
@@ -255,9 +295,10 @@ class WpRestAuth:
 
 
 class WpRestClient:
-    def __init__(self, auth: WpRestAuth, *, timeout_seconds: int = 20) -> None:
+    def __init__(self, auth: WpRestAuth, *, timeout_seconds: int = DEFAULT_WP_REST_TIMEOUT_S) -> None:
         self._auth = auth
         self._timeout = timeout_seconds
+        self._rate_limit_delay = DEFAULT_WP_REST_RATE_LIMIT_S
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -265,6 +306,15 @@ class WpRestClient:
             auth=(self._auth.username, self._auth.application_password),
             timeout=httpx.Timeout(self._timeout),
             headers={"Accept": "application/json"},
+        )
+
+    def _wp_json_root_client(self) -> httpx.Client:
+        """Client rooted at ``/wp-json`` for plugin REST namespaces (Redirection, Rank Math)."""
+        return httpx.Client(
+            base_url=_wp_json_root_base(self._auth.base_url),
+            auth=(self._auth.username, self._auth.application_password),
+            timeout=httpx.Timeout(self._timeout),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
         )
 
     def detect_seo_plugins(self) -> dict[str, bool]:
@@ -364,7 +414,10 @@ class WpRestClient:
                 
                 # If permission denied or endpoint not available, use fallback detection
                 if r.status_code in (401, 403, 404):
-                    logger.info(f"Full plugin listing not available (HTTP {r.status_code}), using endpoint detection fallback")
+                    logger.info(
+                        "Full plugin listing not available (HTTP %s), using endpoint detection fallback",
+                        r.status_code,
+                    )
                     plugins_list["list_source"] = "endpoint_probe"
                     detected = self.detect_active_plugins()
                     seo_probe = self.detect_seo_plugins()
@@ -424,12 +477,12 @@ class WpRestClient:
                 # Other HTTP errors
                 plugins_list["list_source"] = None
                 plugins_list["error"] = f"Failed to fetch plugins (HTTP {r.status_code})"
-                logger.warning(f"Plugin listing returned {r.status_code}")
+                logger.warning("Plugin listing returned %s", r.status_code)
                 return plugins_list
                 
         except Exception as e:
             plugins_list["error"] = f"Error fetching plugins: {str(e)}"
-            logger.error(f"Failed to list plugins: {str(e)}")
+            logger.error("Failed to list plugins: %s", e)
         
         return plugins_list
 
@@ -441,8 +494,8 @@ class WpRestClient:
         Returns dict like: {'redirection': True, 'rank_math_redirects': False, ...}
         """
         active_plugins = {}
-        
-        with self._client() as c:
+
+        with self._wp_json_root_client() as c:
             # Try Redirection plugin endpoint - this is the most reliable method
             try:
                 r = c.get("/redirection/v1/redirect", params={"per_page": 1})
@@ -453,10 +506,10 @@ class WpRestClient:
                     active_plugins["redirection"] = True
                     logger.debug("Redirection plugin detected (API endpoint responsive)")
                 else:
-                    logger.debug(f"Redirection plugin check returned {r.status_code}")
+                    logger.debug("Redirection plugin check returned %s", r.status_code)
             except Exception as e:
-                logger.debug(f"Redirection plugin check failed: {str(e)}")
-            
+                logger.debug("Redirection plugin check failed: %s", e)
+
             # Try Rank Math redirects endpoint
             try:
                 r = c.get("/rank-math/v1/redirects", params={"per_page": 1})
@@ -464,16 +517,17 @@ class WpRestClient:
                     active_plugins["rank_math_redirects"] = True
                     logger.debug("Rank Math redirects detected")
             except Exception as e:
-                logger.debug(f"Rank Math redirects check failed: {str(e)}")
-            
-            # Try Safe Redirect Manager endpoint
+                logger.debug("Rank Math redirects check failed: %s", e)
+
+        # Safe Redirect Manager registers CPT at wp/v2/redirects (base …/wp-json/wp/v2 + path /redirects)
+        with self._client() as c:
             try:
-                r = c.get("/wp/v2/redirects", params={"per_page": 1})
+                r = c.get("/redirects", params={"per_page": 1})
                 if r.status_code in (200, 403):
                     active_plugins["safe_redirect_manager"] = True
                     logger.debug("Safe Redirect Manager detected")
             except Exception as e:
-                logger.debug(f"Safe Redirect Manager check failed: {str(e)}")
+                logger.debug("Safe Redirect Manager check failed: %s", e)
         
         # SEO plugins: reuse redirect namespace for Rank Math; probe others
         seo = self.detect_seo_plugins()
@@ -566,7 +620,7 @@ class WpRestClient:
             
             # Validate that the update was actually applied
             if not isinstance(result, dict) or result.get("id") != post_id:
-                logger.warning(f"Update post {post_id} returned unexpected response: {result}")
+                logger.warning("Update post %s returned unexpected response: %s", post_id, result)
             
             return result
     
@@ -583,7 +637,7 @@ class WpRestClient:
         try:
             post_obj = self.get_post(post_id)
         except Exception as e:
-            logger.error(f"Failed to fetch post {post_id}: {str(e)}")
+            logger.error("Failed to fetch post %s: %s", post_id, e)
             raise
 
         active_plugins = self.detect_active_plugins()
@@ -630,7 +684,7 @@ class WpRestClient:
                         )
                         return result
                     if r.status_code == 403:
-                        logger.debug(f"{plugin_name} ({meta_key}): 403 Forbidden")
+                        logger.debug("%s (%s): 403 Forbidden", plugin_name, meta_key)
                 except Exception as e:
                     logger.debug(
                         profile.debug_fail_fmt.format(
@@ -661,7 +715,9 @@ class WpRestClient:
                         return result
                     if r.status_code == 403:
                         logger.debug(
-                            f"{plugin_name} ({meta_key}): 403 Forbidden (expected for private meta)"
+                            "%s (%s): 403 Forbidden (expected for private meta)",
+                            plugin_name,
+                            meta_key,
                         )
                 except Exception as e:
                     logger.debug(
@@ -1009,99 +1065,114 @@ class WpRestClient:
         if from_url and not from_url.startswith("/"):
             from_url = "/" + from_url
 
-        with self._client() as c:
-            for backend in backends:
-                if backend == "redirection":
-                    try:
-                        payload = {
-                            "source": from_url,
-                            "target": to_url,
-                            "regex": False,
-                            "match_type": "url",
-                            "status_code": 301,
-                            "group_id": 1,
-                            "enabled": True,
+        for backend in backends:
+            if backend == "redirection":
+                try:
+                    time.sleep(self._rate_limit_delay)
+                    with self._wp_json_root_client() as c:
+                        r = c.post(
+                            "/redirection/v1/redirect",
+                            json=_redirection_plugin_create_payload(from_url, to_url),
+                            timeout=10.0,
+                        )
+
+                    if 200 <= r.status_code < 300:
+                        result = r.json()
+                        redirect_id = result.get("id") if isinstance(result, dict) else None
+                        logger.info(
+                            "Redirection: created redirect from=%s to=%s id=%s",
+                            from_url,
+                            to_url,
+                            redirect_id,
+                        )
+                        return {
+                            "status": "created",
+                            "plugin": "Redirection",
+                            "id": redirect_id,
+                            "from_url": from_url,
+                            "to_url": to_url,
+                            "message": "Redirect created successfully via Redirection plugin",
                         }
-                        r = c.post("/redirection/v1/redirect", json=payload, timeout=10.0)
+                    elif r.status_code == 403:
+                        logger.warning("Redirection plugin API returned 403 (permission denied)")
+                    elif r.status_code == 404:
+                        logger.debug("Redirection plugin API endpoint not found (404)")
+                    else:
+                        logger.warning("Redirection plugin API returned %s", r.status_code)
+                except Exception as e:
+                    logger.debug(
+                        "Redirection plugin attempt failed: %s: %s",
+                        type(e).__name__,
+                        e,
+                    )
 
-                        if 200 <= r.status_code < 300:
-                            result = r.json()
-                            redirect_id = result.get("id") if isinstance(result, dict) else None
-                            logger.info(
-                                f"✓ Redirection: Successfully created redirect {from_url} → {to_url}, id={redirect_id}"
-                            )
-                            return {
-                                "status": "created",
-                                "plugin": "Redirection",
-                                "id": redirect_id,
-                                "from_url": from_url,
-                                "to_url": to_url,
-                                "message": "Redirect created successfully via Redirection plugin",
-                            }
-                        elif r.status_code == 403:
-                            logger.warning("Redirection plugin API returned 403 (permission denied)")
-                        elif r.status_code == 404:
-                            logger.debug("Redirection plugin API endpoint not found (404)")
-                        else:
-                            logger.warning(f"Redirection plugin API returned {r.status_code}")
-                    except Exception as e:
-                        logger.debug(f"Redirection plugin attempt failed: {type(e).__name__}: {str(e)}")
+            elif backend == "rank_math":
+                try:
+                    time.sleep(self._rate_limit_delay)
+                    with self._wp_json_root_client() as c:
+                        r = c.post(
+                            "/rank-math/v1/redirects",
+                            json=_rank_math_redirect_create_payload(from_url, to_url),
+                            timeout=10.0,
+                        )
 
-                elif backend == "rank_math":
-                    try:
-                        payload = {
-                            "source": from_url,
-                            "target": to_url,
-                            "type": "301",
-                            "enabled": True,
+                    if 200 <= r.status_code < 300:
+                        result = r.json()
+                        redirect_id = result.get("id") if isinstance(result, dict) else None
+                        logger.info(
+                            "Rank Math: created redirect from=%s to=%s id=%s",
+                            from_url,
+                            to_url,
+                            redirect_id,
+                        )
+                        return {
+                            "status": "created",
+                            "plugin": "Rank Math",
+                            "id": redirect_id,
+                            "from_url": from_url,
+                            "to_url": to_url,
+                            "message": "Redirect created successfully via Rank Math",
                         }
-                        r = c.post("/rank-math/v1/redirects", json=payload, timeout=10.0)
+                except Exception as e:
+                    logger.debug("Rank Math redirects API attempt failed: %s", e)
 
-                        if 200 <= r.status_code < 300:
-                            result = r.json()
-                            redirect_id = result.get("id") if isinstance(result, dict) else None
-                            logger.info(
-                                f"✓ Rank Math: Successfully created redirect {from_url} → {to_url}, id={redirect_id}"
-                            )
-                            return {
-                                "status": "created",
-                                "plugin": "Rank Math",
-                                "id": redirect_id,
-                                "from_url": from_url,
-                                "to_url": to_url,
-                                "message": "Redirect created successfully via Rank Math",
-                            }
-                    except Exception as e:
-                        logger.debug(f"Rank Math redirects API attempt failed: {str(e)}")
+            elif backend == "safe_redirect_manager":
+                try:
+                    time.sleep(self._rate_limit_delay)
+                    with self._client() as c:
+                        r = c.post(
+                            "/redirects",
+                            json=_safe_redirect_manager_create_payload(from_url, to_url),
+                            timeout=10.0,
+                        )
 
-                elif backend == "safe_redirect_manager":
-                    try:
-                        payload = {
-                            "redirect_from": from_url,
-                            "redirect_to": to_url,
-                            "redirect_code": "301",
+                    if 200 <= r.status_code < 300:
+                        result = r.json()
+                        redirect_id = result.get("id") if isinstance(result, dict) else None
+                        logger.info(
+                            "Safe Redirect Manager: created redirect from=%s to=%s id=%s",
+                            from_url,
+                            to_url,
+                            redirect_id,
+                        )
+                        return {
+                            "status": "created",
+                            "plugin": "Safe Redirect Manager",
+                            "id": redirect_id,
+                            "from_url": from_url,
+                            "to_url": to_url,
+                            "message": "Redirect created successfully via Safe Redirect Manager",
                         }
-                        r = c.post("/wp/v2/redirects", json=payload, timeout=10.0)
-
-                        if 200 <= r.status_code < 300:
-                            result = r.json()
-                            redirect_id = result.get("id") if isinstance(result, dict) else None
-                            logger.info(
-                                f"✓ Safe Redirect Manager: Successfully created redirect {from_url} → {to_url}"
-                            )
-                            return {
-                                "status": "created",
-                                "plugin": "Safe Redirect Manager",
-                                "id": redirect_id,
-                                "from_url": from_url,
-                                "to_url": to_url,
-                                "message": "Redirect created successfully via Safe Redirect Manager",
-                            }
-                    except Exception as e:
-                        logger.debug(f"Safe Redirect Manager API attempt failed: {str(e)}")
+                except Exception as e:
+                    logger.debug("Safe Redirect Manager API attempt failed: %s", e)
 
         error_msg = "No redirect plugin REST API succeeded for this request."
-        logger.error(f"✗ Failed to create redirect {from_url} → {to_url}: {error_msg}")
+        logger.error(
+            "Failed to create redirect from=%s to=%s: %s",
+            from_url,
+            to_url,
+            error_msg,
+        )
 
         return {
             "status": "failed",
@@ -1168,7 +1239,7 @@ class WordPressRESTClient:
         base_url: str,
         username: str,
         app_password: str,
-        timeout_seconds: int = 30,
+        timeout_seconds: int = DEFAULT_WP_REST_TIMEOUT_S,
     ):
         """Initialize the REST API client.
 
@@ -1182,7 +1253,9 @@ class WordPressRESTClient:
         self.username = username
         self.app_password = app_password
         self.timeout = httpx.Timeout(timeout_seconds)
-        self._rate_limit_delay = 0.5  # seconds between requests
+        self._rate_limit_delay = float(
+            os.getenv("WP_REST_RATE_LIMIT_DELAY_SEC", str(DEFAULT_WP_REST_RATE_LIMIT_S))
+        )
 
     def _get_client(self) -> httpx.Client:
         """Create an authenticated httpx client."""
@@ -1201,7 +1274,7 @@ class WordPressRESTClient:
                 resp.raise_for_status()
                 return True
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error("Health check failed: %s", e)
             raise
 
     # ========================
@@ -1239,7 +1312,7 @@ class WordPressRESTClient:
                     if resp.status_code == 200:
                         results.extend(resp.json())
                 except Exception as e:
-                    logger.warning(f"Search failed for {endpoint}: {e}")
+                    logger.warning("Search failed for %s: %s", endpoint, e)
             return results
 
     def resolve_post_by_url(self, url: str) -> int | None:
@@ -1586,11 +1659,7 @@ class WordPressRESTClient:
                 time.sleep(self._rate_limit_delay)
                 resp = client.post(
                     "/redirection/v1/redirect",
-                    json={
-                        "source": source_url,
-                        "target": target_url,
-                        "status_code": 301,
-                    },
+                    json=_redirection_plugin_create_payload(source_url, target_url),
                 )
                 resp.raise_for_status()
                 duration = (time.time() - start_time) * 1000
@@ -1623,11 +1692,7 @@ class WordPressRESTClient:
                 time.sleep(self._rate_limit_delay)
                 resp = client.post(
                     "/rank-math/v1/redirects",
-                    json={
-                        "sources": [{"source": source_url}],
-                        "destination": target_url,
-                        "type": "301",
-                    },
+                    json=_rank_math_redirect_create_payload(source_url, target_url),
                 )
                 resp.raise_for_status()
                 duration = (time.time() - start_time) * 1000

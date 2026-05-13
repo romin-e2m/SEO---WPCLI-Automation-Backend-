@@ -64,3 +64,30 @@ class UpdatePostResponse(BaseModel):
     updated: bool
     post_id: int
     raw: dict[str, Any] | None = None
+
+
+class PluginInfo(BaseModel):
+    """Single plugin information."""
+
+    name: str
+    title: str
+    status: str  # "active" or "inactive"
+    type: str  # "seo", "redirect", or "other"
+
+
+class PluginListResponse(BaseModel):
+    """Response for listing all plugins."""
+
+    installed: list[PluginInfo]
+    seo_plugins: list[PluginInfo]
+    redirect_plugins: list[PluginInfo]
+    error: str | None = None
+    list_source: str | None = None
+
+
+class PluginDetectionResponse(BaseModel):
+    """Response for plugin detection."""
+
+    detected_plugins: dict[str, bool]
+    seo_plugins: list[str]
+    redirect_plugins: list[str]

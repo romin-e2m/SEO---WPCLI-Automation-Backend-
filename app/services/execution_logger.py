@@ -56,6 +56,29 @@ class ExecutionLogger:
             )
             self.logs.append(entry)
 
+    def append_monitor_entry(self, log_entry: dict) -> None:
+        """Append a preformatted dict from the monitor broadcaster (same shape as log_sync output)."""
+        with self._lock:
+            self._log_counter += 1
+            raw_id = log_entry.get("id")
+            entry_id = raw_id if raw_id else f"log_{self.execution_id}_{self._log_counter}"
+            entry = ExecutionLogEntry(
+                id=entry_id,
+                timestamp=log_entry["timestamp"],
+                action=log_entry["action"],
+                status=log_entry["status"],
+                details=log_entry.get("details"),
+                execution_id=self.execution_id,
+            )
+            self.logs.append(entry)
+
+    def clear(self) -> None:
+        """Reset logs (e.g. before a new dry-run or execute)."""
+        with self._lock:
+            self.logs = []
+            self._log_counter = 0
+            self._complete = False
+
     def get_logs(self) -> list[dict]:
         """Get all logs so far."""
         with self._lock:

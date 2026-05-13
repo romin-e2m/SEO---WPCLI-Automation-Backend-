@@ -5,10 +5,20 @@ import platform
 import socket
 import sys
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
+from app.services.execution_log_registry import append_log_entry, ensure
+
 router = APIRouter(prefix="/system", tags=["system"])
+
+# SSE execution log stream: bounded duration / poll cadence (override via env).
+_SSE_POLL_INTERVAL_SEC = float(os.getenv("SSE_EXECUTION_STREAM_POLL_INTERVAL_SEC", "0.5"))
+_SSE_MAX_DURATION_SEC = float(os.getenv("SSE_EXECUTION_STREAM_MAX_DURATION_SEC", "300"))
+_SSE_MAX_ITERATIONS = max(
+    1,
+    int(_SSE_MAX_DURATION_SEC / max(_SSE_POLL_INTERVAL_SEC, 0.01)),
+)
 
 
 def _detect_environment():
@@ -121,13 +131,11 @@ def get_system_status():
     }
 
 
-# Global store for execution logs
-_execution_logs_store: dict[str, list[dict]] = {}
-
-
 def clear_execution_logs(execution_id: str) -> None:
     """Reset buffered logs for an execution (e.g. before a new dry-run / execute)."""
-    _execution_logs_store[execution_id] = []
+    from app.services.execution_log_registry import clear_logs
+
+    clear_logs(execution_id)
 
 
 def _sse_log_payload(log: dict) -> str:
@@ -148,27 +156,23 @@ async def _stream_generator(execution_id: str):
     )
 
     last_index = 0
-    max_iterations = 600  # 5 minutes @ 500ms checks
 
-    for _ in range(max_iterations):
-        if execution_id in _execution_logs_store:
-            logs = _execution_logs_store[execution_id]
-            # Logs can be replaced with a fresh list (see clear_execution_logs); keep cursor valid.
-            if last_index > len(logs):
-                last_index = 0
-            if len(logs) > last_index:
-                for log in logs[last_index:]:
-                    yield _sse_log_payload(log)
-                last_index = len(logs)
+    for _ in range(_SSE_MAX_ITERATIONS):
+        logs = ensure(execution_id).get_logs()
+        if last_index > len(logs):
+            last_index = 0
+        if len(logs) > last_index:
+            for log in logs[last_index:]:
+                yield _sse_log_payload(log)
+            last_index = len(logs)
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(_SSE_POLL_INTERVAL_SEC)
 
 
 @router.get("/execution/stream")
 async def get_execution_stream(execution_id: str = Query("default")):
     """SSE endpoint for live execution logs."""
-    if execution_id not in _execution_logs_store:
-        _execution_logs_store[execution_id] = []
+    ensure(execution_id)
 
     return StreamingResponse(
         _stream_generator(execution_id),
@@ -182,7 +186,5 @@ async def get_execution_stream(execution_id: str = Query("default")):
 
 
 def add_execution_log(execution_id: str, log_entry: dict):
-    """Add a log entry to the execution stream."""
-    if execution_id not in _execution_logs_store:
-        _execution_logs_store[execution_id] = []
-    _execution_logs_store[execution_id].append(log_entry)
+    """Add a log entry to the execution stream (same backing store as /api/run)."""
+    append_log_entry(execution_id, log_entry)

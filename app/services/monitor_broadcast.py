@@ -1,15 +1,17 @@
-"""Push high-level steps to the live browser monitor (SSE store in app.api.system)."""
+"""Push high-level steps to the live browser monitor (shared ExecutionLogger registry)."""
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
 
+from app.services.execution_log_registry import append_log_entry
+from app.services.monitor_context import current_monitor_execution_id
 
-def _emit(execution_id: str, action: str, status: str, details: str | None) -> None:
-    from app.api.system import add_execution_log
 
-    add_execution_log(
+def _emit(action: str, status: str, details: str | None) -> None:
+    execution_id = current_monitor_execution_id.get()
+    append_log_entry(
         execution_id,
         {
             "id": f"log_{uuid.uuid4().hex[:12]}",
@@ -24,18 +26,17 @@ def _emit(execution_id: str, action: str, status: str, details: str | None) -> N
 MONITOR_DEFAULT_ID = "default"
 
 
-def clear_monitor_logs(execution_id: str = MONITOR_DEFAULT_ID) -> None:
-    from app.api.system import clear_execution_logs
+def clear_monitor_logs() -> None:
+    from app.services.execution_log_registry import clear_logs
 
-    clear_execution_logs(execution_id)
+    clear_logs(current_monitor_execution_id.get())
 
 
-def emit_monitor_phase(execution_id: str, label: str, details: str | None = None) -> None:
-    _emit(execution_id, label, "success", details)
+def emit_monitor_phase(label: str, details: str | None = None) -> None:
+    _emit(label, "success", details)
 
 
 def emit_monitor_row_dry(
-    execution_id: str,
     action: str,
     sheet_name: str,
     row_index: int,
@@ -45,7 +46,6 @@ def emit_monitor_row_dry(
     st = _outcome_to_status(outcome)
     msg = message or ""
     _emit(
-        execution_id,
         f"Dry-run [{action}] {sheet_name} row {row_index}: {outcome}",
         st,
         msg[:2000] if msg else None,
@@ -53,7 +53,6 @@ def emit_monitor_row_dry(
 
 
 def emit_monitor_row_exec(
-    execution_id: str,
     action: str,
     sheet_name: str,
     row_index: int,
@@ -63,16 +62,15 @@ def emit_monitor_row_exec(
     st = _exec_outcome_to_status(outcome)
     msg = message or ""
     _emit(
-        execution_id,
         f"Execute [{action}] {sheet_name} row {row_index}: {outcome}",
         st,
         msg[:2000] if msg else None,
     )
 
 
-def emit_monitor_playwright(execution_id: str, action: str, level: str, details: str) -> None:
+def emit_monitor_playwright(action: str, level: str, details: str) -> None:
     st = _level_to_status(level)
-    _emit(execution_id, action, st, details or None)
+    _emit(action, st, details or None)
 
 
 def _outcome_to_status(outcome: str) -> str:

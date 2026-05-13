@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid as uuid_module
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -78,6 +79,21 @@ class ExecuteRequest(RunGroupedPayload):
     )
     redirect_plugin: str | None = None
     seo_plugin: str | None = None
+    execution_id: str | None = Field(
+        default=None,
+        description="Optional client-generated UUID so UIs can subscribe to logs before the run completes.",
+    )
+
+    @field_validator("execution_id")
+    @classmethod
+    def _optional_uuid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            uuid_module.UUID(v)
+        except ValueError as e:
+            raise ValueError("execution_id must be a valid UUID") from e
+        return v
 
     @field_validator("confirm_execute")
     @classmethod

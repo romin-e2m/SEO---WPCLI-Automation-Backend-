@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-
 from app.schemas.wp import (
+    PluginDetectionResponse,
+    PluginInfo,
+    PluginListResponse,
     ResolvePostRequest,
     ResolvePostResponse,
     SitePrecheckRequest,
@@ -16,30 +17,6 @@ from app.services.wp_site import resolve_post_url, rest_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wp", tags=["wordpress"])
-
-
-class PluginInfo(BaseModel):
-    """Single plugin information."""
-    name: str
-    title: str
-    status: str  # "active" or "inactive"
-    type: str    # "seo", "redirect", or "other"
-
-
-class PluginListResponse(BaseModel):
-    """Response for listing all plugins."""
-    installed: list[PluginInfo]
-    seo_plugins: list[PluginInfo]
-    redirect_plugins: list[PluginInfo]
-    error: str | None = None
-    list_source: str | None = None
-
-
-class PluginDetectionResponse(BaseModel):
-    """Response for plugin detection."""
-    detected_plugins: dict[str, bool]
-    seo_plugins: list[str]
-    redirect_plugins: list[str]
 
 
 @router.post("/site/precheck", response_model=SitePrecheckResponse)
@@ -90,9 +67,9 @@ def detect_plugins(body: SitePrecheckRequest) -> PluginDetectionResponse:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Plugin detection failed: {str(e)}") from e
     
-    # Categorize plugins
+    # Categorize plugins (display names are fixed strings; do not .title() — it breaks brand casing)
     seo_plugins = [
-        name.replace("_", " ").title()
+        name
         for key, name in [
             ("yoast", "Yoast SEO"),
             ("rank_math", "Rank Math"),
@@ -100,9 +77,9 @@ def detect_plugins(body: SitePrecheckRequest) -> PluginDetectionResponse:
         ]
         if plugins.get(key, False)
     ]
-    
+
     redirect_plugins = [
-        name.replace("_", " ").title()
+        name
         for key, name in [
             ("redirection", "Redirection"),
             ("rank_math_redirects", "Rank Math"),

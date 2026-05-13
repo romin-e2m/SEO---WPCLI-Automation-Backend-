@@ -33,6 +33,7 @@ from app.services.monitor_broadcast import (
     emit_monitor_row_dry,
     emit_monitor_row_exec,
 )
+from app.services.monitor_context import current_monitor_execution_id
 from app.services.execution_logger import ExecutionLogger
 
 logger = logging.getLogger(__name__)
@@ -1321,62 +1322,64 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
     if total > limit:
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
 
-    clear_monitor_logs(MONITOR_DEFAULT_ID)
-    emit_monitor_phase(MONITOR_DEFAULT_ID, "Dry-run started", f"{total} row(s)")
+    token = current_monitor_execution_id.set(MONITOR_DEFAULT_ID)
+    try:
+        clear_monitor_logs()
+        emit_monitor_phase("Dry-run started", f"{total} row(s)")
 
-    rows_out: list[DryRunRowResult] = []
-    for action, row in _iter_rows(grouped):
-        try:
-            if action == "on_page":
-                rows_out.append(_dry_on_page(site, row))
-            elif action == "meta":
-                rows_out.append(_dry_meta(site, row))
-            elif action == "meta_title":
-                rows_out.append(_dry_meta_title(site, row))
-            elif action == "images":
-                rows_out.append(_dry_on_image(site, row))
-            elif action == "url_cleanup":
-                rows_out.append(_dry_url_cleanup(site, row))
-            elif action == "redirects_301":
-                rows_out.append(_dry_redirects_301(site, row, redirect_plugin))
-        except Exception as e:
-            logger.error(f"Dry-run error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
-            rows_out.append(DryRunRowResult(
-                action_type=action,
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="error",
-                message=f"Internal error: {str(e)}",
-            ))
-        dr = rows_out[-1]
-        emit_monitor_row_dry(
-            MONITOR_DEFAULT_ID,
-            action,
-            dr.sheet_name,
-            dr.row_index,
-            str(dr.outcome),
-            dr.message,
+        rows_out: list[DryRunRowResult] = []
+        for action, row in _iter_rows(grouped):
+            try:
+                if action == "on_page":
+                    rows_out.append(_dry_on_page(site, row))
+                elif action == "meta":
+                    rows_out.append(_dry_meta(site, row))
+                elif action == "meta_title":
+                    rows_out.append(_dry_meta_title(site, row))
+                elif action == "images":
+                    rows_out.append(_dry_on_image(site, row))
+                elif action == "url_cleanup":
+                    rows_out.append(_dry_url_cleanup(site, row))
+                elif action == "redirects_301":
+                    rows_out.append(_dry_redirects_301(site, row, redirect_plugin))
+            except Exception as e:
+                logger.error(f"Dry-run error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}")
+                rows_out.append(DryRunRowResult(
+                    action_type=action,
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="error",
+                    message=f"Internal error: {str(e)}",
+                ))
+            dr = rows_out[-1]
+            emit_monitor_row_dry(
+                action,
+                dr.sheet_name,
+                dr.row_index,
+                str(dr.outcome),
+                dr.message,
+            )
+
+        ready = sum(1 for r in rows_out if r.outcome == "change")
+        blocked = sum(1 for r in rows_out if r.outcome == "blocked")
+        errors = sum(1 for r in rows_out if r.outcome == "error")
+        no_change = sum(1 for r in rows_out if r.outcome == "no_change")
+
+        emit_monitor_phase(
+            "Dry-run finished",
+            f"change={ready}, blocked={blocked}, error={errors}, no_change={no_change}",
         )
 
-    ready = sum(1 for r in rows_out if r.outcome == "change")
-    blocked = sum(1 for r in rows_out if r.outcome == "blocked")
-    errors = sum(1 for r in rows_out if r.outcome == "error")
-    no_change = sum(1 for r in rows_out if r.outcome == "no_change")
-
-    emit_monitor_phase(
-        MONITOR_DEFAULT_ID,
-        "Dry-run finished",
-        f"change={ready}, blocked={blocked}, error={errors}, no_change={no_change}",
-    )
-
-    return DryRunResponse(
-        rows_processed=len(rows_out),
-        ready_to_execute=ready,
-        blocked=blocked,
-        errors=errors,
-        no_change=no_change,
-        rows=rows_out,
-    )
+        return DryRunResponse(
+            rows_processed=len(rows_out),
+            ready_to_execute=ready,
+            blocked=blocked,
+            errors=errors,
+            no_change=no_change,
+            rows=rows_out,
+        )
+    finally:
+        current_monitor_execution_id.reset(token)
 
 
 def _exec_on_page(site: SiteAccess, row: NormalizedRow) -> ExecuteRowResult:
@@ -2019,115 +2022,118 @@ def run_execute(
             execution_logger.mark_complete()
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
 
-    def _log_row(er: ExecuteRowResult) -> None:
-        if execution_logger is None:
-            return
-        st = (
-            "success"
-            if er.outcome == "updated"
-            else ("warning" if er.outcome == "skipped" else "error")
-        )
-        execution_logger.log_sync(
-            f"{er.action_type} row {er.row_index}",
-            st,
-            er.message or er.outcome,
-        )
-
-    clear_monitor_logs(MONITOR_DEFAULT_ID)
-    emit_monitor_phase(MONITOR_DEFAULT_ID, "Execute started", f"{total} row(s)")
-    if execution_logger is not None:
-        execution_logger.log_sync(
-            "execute_started", "pending", f"{total} row(s) to process"
-        )
-
-    rows_out: list[ExecuteRowResult] = []
+    eid = execution_logger.execution_id if execution_logger else MONITOR_DEFAULT_ID
+    token = current_monitor_execution_id.set(eid)
     try:
-        rows_iter = list(_iter_rows(grouped))
-        i = 0
-        while i < len(rows_iter):
-            action, row = rows_iter[i]
-            try:
-                if action in ("meta", "meta_title") and site.playwright:
-                    spec = _SEO_PW_META if action == "meta" else _SEO_PW_META_TITLE
-                    batch_rows: list[NormalizedRow] = []
-                    while i < len(rows_iter) and rows_iter[i][0] == action:
-                        batch_rows.append(rows_iter[i][1])
-                        i += 1
-                    for er in _exec_seo_consecutive_playwright_batch(
-                        site, batch_rows, seo_plugin, spec
-                    ):
-                        rows_out.append(er)
-                        emit_monitor_row_exec(
-                            MONITOR_DEFAULT_ID,
-                            er.action_type,
-                            er.sheet_name,
-                            er.row_index,
-                            str(er.outcome),
-                            er.message,
-                        )
-                        _log_row(er)
-                    continue
 
-                if action == "on_page":
-                    rows_out.append(_exec_on_page(site, row))
-                elif action == "meta":
-                    rows_out.append(_exec_meta(site, row, seo_plugin))
-                elif action == "meta_title":
-                    rows_out.append(_exec_meta_title(site, row, seo_plugin))
-                elif action == "images":
-                    rows_out.append(_exec_on_image(site, row))
-                elif action == "url_cleanup":
-                    rows_out.append(_exec_url_cleanup(site, row))
-                elif action == "redirects_301":
-                    rows_out.append(_exec_redirects_301(site, row, redirect_plugin))
-            except Exception as e:
-                logger.error(
-                    f"Execute error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}"
-                )
-                rows_out.append(
-                    ExecuteRowResult(
-                        action_type=action,
-                        sheet_name=row.sheet_name,
-                        row_index=row.row_index,
-                        outcome="failed",
-                        message=f"Internal error: {str(e)}",
-                    )
-                )
-            er = rows_out[-1]
-            emit_monitor_row_exec(
-                MONITOR_DEFAULT_ID,
-                action,
-                er.sheet_name,
-                er.row_index,
-                str(er.outcome),
-                er.message,
+        def _log_row(er: ExecuteRowResult) -> None:
+            if execution_logger is None:
+                return
+            st = (
+                "success"
+                if er.outcome == "updated"
+                else ("warning" if er.outcome == "skipped" else "error")
             )
-            _log_row(er)
-            i += 1
+            execution_logger.log_sync(
+                f"{er.action_type} row {er.row_index}",
+                st,
+                er.message or er.outcome,
+            )
 
-        updated = sum(1 for r in rows_out if r.outcome == "updated")
-        skipped = sum(1 for r in rows_out if r.outcome == "skipped")
-        failed = sum(1 for r in rows_out if r.outcome == "failed")
-
-        emit_monitor_phase(
-            MONITOR_DEFAULT_ID,
-            "Execute finished",
-            f"updated={updated}, skipped={skipped}, failed={failed}",
-        )
+        clear_monitor_logs()
+        emit_monitor_phase("Execute started", f"{total} row(s)")
         if execution_logger is not None:
             execution_logger.log_sync(
-                "execute_finished",
-                "success",
-                f"updated={updated}, skipped={skipped}, failed={failed}",
+                "execute_started", "pending", f"{total} row(s) to process"
             )
 
-        return ExecuteResponse(
-            rows_processed=len(rows_out),
-            updated=updated,
-            skipped=skipped,
-            failed=failed,
-            rows=rows_out,
-        )
+        rows_out: list[ExecuteRowResult] = []
+        try:
+            rows_iter = list(_iter_rows(grouped))
+            i = 0
+            while i < len(rows_iter):
+                action, row = rows_iter[i]
+                try:
+                    if action in ("meta", "meta_title") and site.playwright:
+                        spec = _SEO_PW_META if action == "meta" else _SEO_PW_META_TITLE
+                        batch_rows: list[NormalizedRow] = []
+                        while i < len(rows_iter) and rows_iter[i][0] == action:
+                            batch_rows.append(rows_iter[i][1])
+                            i += 1
+                        for er in _exec_seo_consecutive_playwright_batch(
+                            site, batch_rows, seo_plugin, spec
+                        ):
+                            rows_out.append(er)
+                            emit_monitor_row_exec(
+                                er.action_type,
+                                er.sheet_name,
+                                er.row_index,
+                                str(er.outcome),
+                                er.message,
+                            )
+                            _log_row(er)
+                        continue
+
+                    if action == "on_page":
+                        rows_out.append(_exec_on_page(site, row))
+                    elif action == "meta":
+                        rows_out.append(_exec_meta(site, row, seo_plugin))
+                    elif action == "meta_title":
+                        rows_out.append(_exec_meta_title(site, row, seo_plugin))
+                    elif action == "images":
+                        rows_out.append(_exec_on_image(site, row))
+                    elif action == "url_cleanup":
+                        rows_out.append(_exec_url_cleanup(site, row))
+                    elif action == "redirects_301":
+                        rows_out.append(_exec_redirects_301(site, row, redirect_plugin))
+                except Exception as e:
+                    logger.error(
+                        f"Execute error for {action} row {row.row_index}: {type(e).__name__}: {str(e)}"
+                    )
+                    rows_out.append(
+                        ExecuteRowResult(
+                            action_type=action,
+                            sheet_name=row.sheet_name,
+                            row_index=row.row_index,
+                            outcome="failed",
+                            message=f"Internal error: {str(e)}",
+                        )
+                    )
+                er = rows_out[-1]
+                emit_monitor_row_exec(
+                    action,
+                    er.sheet_name,
+                    er.row_index,
+                    str(er.outcome),
+                    er.message,
+                )
+                _log_row(er)
+                i += 1
+
+            updated = sum(1 for r in rows_out if r.outcome == "updated")
+            skipped = sum(1 for r in rows_out if r.outcome == "skipped")
+            failed = sum(1 for r in rows_out if r.outcome == "failed")
+
+            emit_monitor_phase(
+                "Execute finished",
+                f"updated={updated}, skipped={skipped}, failed={failed}",
+            )
+            if execution_logger is not None:
+                execution_logger.log_sync(
+                    "execute_finished",
+                    "success",
+                    f"updated={updated}, skipped={skipped}, failed={failed}",
+                )
+
+            return ExecuteResponse(
+                rows_processed=len(rows_out),
+                updated=updated,
+                skipped=skipped,
+                failed=failed,
+                rows=rows_out,
+            )
+        finally:
+            if execution_logger is not None:
+                execution_logger.mark_complete()
     finally:
-        if execution_logger is not None:
-            execution_logger.mark_complete()
+        current_monitor_execution_id.reset(token)

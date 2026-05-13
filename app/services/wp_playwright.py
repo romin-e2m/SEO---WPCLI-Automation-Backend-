@@ -17,7 +17,7 @@ from playwright.async_api import Locator, Playwright, async_playwright, Page
 
 logger = logging.getLogger(__name__)
 
-SCREENSHOTS_DIR = "/tmp/playwright_screenshots"
+SCREENSHOTS_DIR = os.getenv("PLAYWRIGHT_SCREENSHOTS_DIR", "/tmp/playwright_screenshots")
 os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 
@@ -304,9 +304,9 @@ class PlaywrightLogger:
         logger.log(log_level, formatted)
 
         try:
-            from app.services.monitor_broadcast import MONITOR_DEFAULT_ID, emit_monitor_playwright
+            from app.services.monitor_broadcast import emit_monitor_playwright
 
-            emit_monitor_playwright(MONITOR_DEFAULT_ID, action, level, details)
+            emit_monitor_playwright(action, level, details)
         except Exception:
             pass
 

@@ -36,7 +36,7 @@ def _get_client(site_url: str, username: str, app_password: str) -> WordPressRES
         client.health_check()
         return client
     except Exception as e:
-        logger.error(f"Failed to create REST client: {e}")
+        logger.error("Failed to create REST client: %s", e)
         raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
 
 
@@ -55,7 +55,7 @@ def dry_run_update_title(body: UpdateTitleDryRunRequest) -> DryRunResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Dry-run failed: {e}")
+        logger.error("Dry-run failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Dry-run failed: {str(e)}")
 
 
@@ -69,7 +69,7 @@ def execute_update_title(body: UpdateTitleExecuteRequest) -> OperationResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Execution failed: {e}")
+        logger.error("Execution failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 
@@ -88,7 +88,7 @@ def dry_run_update_content(body: UpdateContentDryRunRequest) -> DryRunResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Dry-run failed: {e}")
+        logger.error("Dry-run failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Dry-run failed: {str(e)}")
 
 
@@ -102,7 +102,7 @@ def execute_update_content(body: UpdateContentExecuteRequest) -> OperationRespon
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Execution failed: {e}")
+        logger.error("Execution failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 
@@ -121,7 +121,7 @@ def dry_run_update_alt_text(body: UpdateAltTextDryRunRequest) -> DryRunResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Dry-run failed: {e}")
+        logger.error("Dry-run failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Dry-run failed: {str(e)}")
 
 
@@ -135,7 +135,7 @@ def execute_update_alt_text(body: UpdateAltTextExecuteRequest) -> OperationRespo
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Execution failed: {e}")
+        logger.error("Execution failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 
@@ -154,7 +154,7 @@ def dry_run_cleanup_urls(body: CleanupUrlsDryRunRequest) -> DryRunResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Dry-run failed: {e}")
+        logger.error("Dry-run failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Dry-run failed: {str(e)}")
 
 
@@ -168,7 +168,7 @@ def execute_cleanup_urls(body: CleanupUrlsExecuteRequest) -> OperationResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Execution failed: {e}")
+        logger.error("Execution failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 
@@ -189,7 +189,7 @@ def dry_run_create_redirect(body: CreateRedirectDryRunRequest) -> DryRunResponse
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Dry-run failed: {e}")
+        logger.error("Dry-run failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Dry-run failed: {str(e)}")
 
 
@@ -217,7 +217,7 @@ def execute_create_redirect(body: CreateRedirectExecuteRequest) -> OperationResp
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Execution failed: {e}")
+        logger.error("Execution failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 
@@ -236,7 +236,12 @@ def execute_batch_operations(body: BatchOperationRequest) -> BatchOperationRespo
 
     for i, op in enumerate(body.operations):
         try:
-            logger.info(f"Processing operation {i+1}/{len(body.operations)}: {op.task_type}")
+            logger.info(
+                "Processing operation %s/%s: %s",
+                i + 1,
+                len(body.operations),
+                op.task_type,
+            )
 
             client = _get_client(op.site_url, op.username, op.app_password.get_secret_value())
 
@@ -273,13 +278,13 @@ def execute_batch_operations(body: BatchOperationRequest) -> BatchOperationRespo
             else:
                 failed += 1
                 if body.stop_on_error:
-                    logger.warning(f"Stopping batch at operation {i+1} due to error")
+                    logger.warning("Stopping batch at operation %s due to error", i + 1)
                     break
 
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Operation {i+1} failed: {e}")
+            logger.error("Operation %s failed: %s", i + 1, e)
             operations.append(
                 OperationResponse(
                     task_type=op.task_type.value if hasattr(op, 'task_type') else "unknown",
