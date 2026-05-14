@@ -1183,7 +1183,7 @@ class WpRestClient:
         }
 
 
-# --- WordPress REST SEO task client (full /wp-json base; used by /api/rest-api routes) ---
+# --- WordPress REST SEO task client (full /wp-json base; standalone task helpers) ---
 class TaskType(str, Enum):
     """All supported SEO automation tasks."""
     UPDATE_TITLE = "update_title"

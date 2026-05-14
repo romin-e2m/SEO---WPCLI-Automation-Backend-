@@ -25,7 +25,7 @@ class DryRunRowResult(BaseModel):
     action_type: str
     sheet_name: str
     row_index: int
-    outcome: Literal["change", "no_change", "blocked", "error"]
+    outcome: Literal["change", "no_change", "blocked", "error", "skip"]
     message: str | None = None
     post_id: int | None = None
     attachment_id: int | None = None
