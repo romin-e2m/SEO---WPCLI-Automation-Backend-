@@ -62,8 +62,8 @@ async def run_qa(
             # Silently skip malformed rows — they were never "updated" anyway
             continue
 
-    # Filter to only rows that were actually updated
-    updated_rows = [r for r in all_rows if r.outcome == "updated"]
+    # Include updated and skipped rows — both represent a final WordPress state worth verifying
+    updated_rows = [r for r in all_rows if r.outcome in ("updated", "skipped")]
 
     # Group by action_type
     grouped: dict[str, list[ExecuteRowResult]] = {}
