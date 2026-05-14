@@ -40,12 +40,34 @@ class DryRunResponse(BaseModel):
     errors: int
     no_change: int
     rows: list[DryRunRowResult] = Field(default_factory=list)
+    dry_run_id: str | None = Field(default=None, description="ID for pause/resume/stream (UUID or 'default').")
+    paused: bool = Field(default=False, description="True when dry-run was paused mid-run.")
+    rows_completed: int = Field(default=0, description="Number of rows completed before pause or finish.")
 
 
 class DryRunRequest(RunGroupedPayload):
     site: SiteAccess
     redirect_plugin: str | None = None
     seo_plugin: str | None = None
+    dry_run_id: str | None = Field(
+        default=None,
+        description="Optional client UUID so the UI can subscribe to SSE before the run completes.",
+    )
+    sheets_url: str | None = Field(
+        default=None,
+        description="Google Sheets URL for status write-back (dry-run; reserved for future use).",
+    )
+
+    @field_validator("dry_run_id")
+    @classmethod
+    def _optional_uuid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            uuid_module.UUID(v)
+        except ValueError as e:
+            raise ValueError("dry_run_id must be a valid UUID") from e
+        return v
 
 
 class ExecuteRowResult(BaseModel):
@@ -69,6 +91,8 @@ class ExecuteResponse(BaseModel):
         default=None,
         description="Populated for /api/run/execute: use with GET /api/run/status and /api/run/stream.",
     )
+    paused: bool = Field(default=False, description="True when execution was paused mid-run.")
+    rows_completed: int = Field(default=0, description="Number of rows completed before pause or finish.")
 
 
 class ExecuteRequest(RunGroupedPayload):
@@ -82,6 +106,10 @@ class ExecuteRequest(RunGroupedPayload):
     execution_id: str | None = Field(
         default=None,
         description="Optional client-generated UUID so UIs can subscribe to logs before the run completes.",
+    )
+    sheets_url: str | None = Field(
+        default=None,
+        description="Google Sheets URL for status write-back after each row is processed.",
     )
 
     @field_validator("execution_id")

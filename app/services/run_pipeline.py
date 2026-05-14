@@ -28,7 +28,6 @@ from app.services.wp_playwright import (
 )
 from app.services.monitor_broadcast import (
     MONITOR_DEFAULT_ID,
-    clear_monitor_logs,
     emit_monitor_phase,
     emit_monitor_row_dry,
     emit_monitor_row_exec,
@@ -1038,6 +1037,7 @@ def _exec_seo_consecutive_playwright_batch(
     batch: list[NormalizedRow],
     seo_plugin: str | None,
     spec: _SeoPlaywrightSpec,
+    execution_logger: "ExecutionLogger | None" = None,
 ) -> list[ExecuteRowResult]:
     """Dry-run each row; run one Playwright session for all rows that need a change."""
     n = len(batch)
@@ -1065,6 +1065,8 @@ def _exec_seo_consecutive_playwright_batch(
                 post_id=dr.post_id,
                 detail=_seo_pw_job_detail(spec, page_url, old_val, rec),
             )
+            if execution_logger is not None and execution_logger.is_paused():
+                break
             continue
 
         pid = dr.post_id
@@ -1077,6 +1079,8 @@ def _exec_seo_consecutive_playwright_batch(
                 message="Missing post id.",
                 detail=_seo_pw_job_detail(spec, page_url, old_val, rec),
             )
+            if execution_logger is not None and execution_logger.is_paused():
+                break
             continue
 
         jobs.append((i, row, pid, page_url, rec, old_val))
@@ -1092,11 +1096,15 @@ def _exec_seo_consecutive_playwright_batch(
                     results[idx] = spec.rest_fallback(
                         site, row, pid, new_v, seo_plugin, url, old_v
                     )
+                    if execution_logger is not None and execution_logger.is_paused():
+                        break
             else:
                 raise
         else:
             for k, (idx, row, pid, url, new_v, old_v) in enumerate(jobs):
                 results[idx] = pw_list[k]
+                if execution_logger is not None and execution_logger.is_paused():
+                    break
 
     return [r for r in results if r is not None]
 
@@ -1316,19 +1324,39 @@ async def _exec_redirects_301_playwright(
 
 
 
-def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redirect_plugin: str | None = None, seo_plugin: str | None = None) -> DryRunResponse:
+def run_dry_run(
+    site: SiteAccess,
+    grouped: dict[str, list[NormalizedRow]],
+    redirect_plugin: str | None = None,
+    seo_plugin: str | None = None,
+    execution_logger: ExecutionLogger | None = None,
+    start_from_row: int = 0,
+) -> DryRunResponse:
     total = _count_grouped(grouped)
     limit = _max_run_rows()
     if total > limit:
+        if execution_logger is not None:
+            execution_logger.log_sync("dry_run_rejected", "error",
+                f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
+            execution_logger.mark_complete()
         raise ValueError(f"Too many rows ({total}). Maximum is {limit} (set MAX_RUN_ROWS).")
 
-    token = current_monitor_execution_id.set(MONITOR_DEFAULT_ID)
+    eid = execution_logger.execution_id if execution_logger else MONITOR_DEFAULT_ID
+    token = current_monitor_execution_id.set(eid)
     try:
-        clear_monitor_logs()
         emit_monitor_phase("Dry-run started", f"{total} row(s)")
+        if execution_logger is not None:
+            execution_logger.log_sync("dry_run_started", "pending", f"{total} row(s) to check")
 
         rows_out: list[DryRunRowResult] = []
-        for action, row in _iter_rows(grouped):
+        rows_iter = list(_iter_rows(grouped))
+        i = max(0, start_from_row)
+        if i > 0 and execution_logger is not None:
+            execution_logger.log_sync("dry_run_resumed", "pending",
+                f"Resuming from row {i} of {len(rows_iter)}")
+
+        while i < len(rows_iter):
+            action, row = rows_iter[i]
             try:
                 if action == "on_page":
                     rows_out.append(_dry_on_page(site, row))
@@ -1352,23 +1380,63 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
                     message=f"Internal error: {str(e)}",
                 ))
             dr = rows_out[-1]
-            emit_monitor_row_dry(
-                action,
-                dr.sheet_name,
-                dr.row_index,
-                str(dr.outcome),
-                dr.message,
-            )
+            emit_monitor_row_dry(action, dr.sheet_name, dr.row_index, str(dr.outcome), dr.message)
+            if execution_logger is not None:
+                st = "success" if dr.outcome in ("change", "no_change") else ("warning" if dr.outcome == "blocked" else "error")
+                execution_logger.log_sync(
+                    f"Dry-run [{action}] {dr.sheet_name} row {dr.row_index}: {dr.outcome}", st, dr.message)
+                v = row.values
+                dr_url: str | None = (
+                    v.get("page_url")
+                    or v.get("source_url")
+                    or v.get("image_url")
+                ) or None
+                dr_current: str | None = None
+                dr_updated: str | None = None
+                if dr.diffs:
+                    d0 = dr.diffs[0]
+                    dr_current = d0.current
+                    dr_updated = d0.proposed
+                execution_logger.append_row_result({
+                    "event_type": "row_result",
+                    "action_type": dr.action_type,
+                    "sheet_name": dr.sheet_name,
+                    "row_index": dr.row_index,
+                    "outcome": dr.outcome,
+                    "run_type": "dry_run",
+                    "url": dr_url,
+                    "current": dr_current,
+                    "updated": dr_updated,
+                    "message": dr.message or None,
+                })
+            i += 1
+            if execution_logger is not None:
+                execution_logger.set_rows_completed(i)
+                if execution_logger.is_paused():
+                    execution_logger.log_sync("dry_run_paused", "warning",
+                        f"Paused after row {i} of {len(rows_iter)}")
+                    execution_logger.mark_complete()
+                    return DryRunResponse(
+                        rows_processed=len(rows_out),
+                        ready_to_execute=sum(1 for r in rows_out if r.outcome == "change"),
+                        blocked=sum(1 for r in rows_out if r.outcome == "blocked"),
+                        errors=sum(1 for r in rows_out if r.outcome == "error"),
+                        no_change=sum(1 for r in rows_out if r.outcome == "no_change"),
+                        rows=rows_out,
+                        paused=True,
+                        rows_completed=i,
+                    )
 
         ready = sum(1 for r in rows_out if r.outcome == "change")
         blocked = sum(1 for r in rows_out if r.outcome == "blocked")
         errors = sum(1 for r in rows_out if r.outcome == "error")
         no_change = sum(1 for r in rows_out if r.outcome == "no_change")
 
-        emit_monitor_phase(
-            "Dry-run finished",
-            f"change={ready}, blocked={blocked}, error={errors}, no_change={no_change}",
-        )
+        emit_monitor_phase("Dry-run finished",
+            f"change={ready}, blocked={blocked}, error={errors}, no_change={no_change}")
+        if execution_logger is not None:
+            execution_logger.log_sync("dry_run_finished", "success",
+                f"change={ready}, blocked={blocked}, error={errors}, no_change={no_change}")
 
         return DryRunResponse(
             rows_processed=len(rows_out),
@@ -1379,6 +1447,8 @@ def run_dry_run(site: SiteAccess, grouped: dict[str, list[NormalizedRow]], redir
             rows=rows_out,
         )
     finally:
+        if execution_logger is not None:
+            execution_logger.mark_complete()
         current_monitor_execution_id.reset(token)
 
 
@@ -2009,6 +2079,8 @@ def run_execute(
     redirect_plugin: str | None = None,
     seo_plugin: str | None = None,
     execution_logger: ExecutionLogger | None = None,
+    start_from_row: int = 0,
+    sheets_url: str | None = None,
 ) -> ExecuteResponse:
     total = _count_grouped(grouped)
     limit = _max_run_rows()
@@ -2039,8 +2111,134 @@ def run_execute(
                 st,
                 er.message or er.outcome,
             )
+            d = er.detail or {}
+            url = (
+                d.get("source_url")
+                or d.get("url")
+                or d.get("page_url")
+                or d.get("image_url")
+                or d.get("destination_url")
+            )
+            current = (
+                d.get("old_title")
+                or d.get("old_meta_description")
+                or d.get("old_meta_title")
+                or d.get("old_alt_text")
+                or d.get("old_url")
+            )
+            updated = (
+                d.get("new_title")
+                or d.get("new_meta_description")
+                or d.get("new_meta_title")
+                or d.get("new_alt_text")
+                or d.get("new_url")
+                or d.get("destination_url")
+            )
+            execution_logger.append_row_result({
+                "event_type": "row_result",
+                "action_type": er.action_type,
+                "sheet_name": er.sheet_name,
+                "row_index": er.row_index,
+                "outcome": er.outcome,
+                "run_type": "execute",
+                "url": url or None,
+                "current": current or None,
+                "updated": updated or None,
+                "message": er.message or None,
+            })
 
-        clear_monitor_logs()
+        # ── Google Sheets write-back (optional) ──────────────────────────────
+        # Initialise a Playwright+Sheets session once if sheets_url is provided.
+        # The session stays open for the duration of the run; each row calls
+        # write_status after processing.  Errors never block the main loop.
+
+        _gs_session: tuple | None = None  # holds (playwright_ctx, browser, page, gs_instance)
+
+        async def _gs_init() -> tuple | None:
+            """Launch a Playwright browser and log into Google Sheets."""
+            from playwright.async_api import async_playwright
+            from app.services.gsheets_playwright import GoogleSheetsPlaywright
+
+            p = await async_playwright().start()
+            browser = await launch_chromium(p, headless=should_run_headless())
+            page = await browser.new_page()
+            gs = GoogleSheetsPlaywright(sheets_url)  # type: ignore[arg-type]
+            ok = await gs.login(page)
+            if not ok:
+                await browser.close()
+                await p.stop()
+                return None
+            return (p, browser, page, gs)
+
+        async def _gs_write(session: tuple, er: ExecuteRowResult) -> None:
+            """Write a single row status back to Google Sheets."""
+            _, _, page, gs = session
+            await gs.write_status(page, er.sheet_name, er.row_index, er.outcome, er.message)
+
+        async def _gs_close(session: tuple) -> None:
+            """Tear down the Playwright browser session."""
+            p, browser, _page, _gs = session
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await p.stop()
+            except Exception:
+                pass
+
+        def _sheets_write_back(er: ExecuteRowResult) -> None:
+            """
+            Synchronous wrapper called after each row result.
+            Errors are caught and logged — they never propagate to the main loop.
+            """
+            nonlocal _gs_session
+            if _gs_session is None:
+                return
+            try:
+                asyncio.run(_gs_write(_gs_session, er))
+            except RuntimeError as exc:
+                if "cannot be called from a running event loop" in str(exc):
+                    # Running inside an already-running loop (e.g. test harness).
+                    # Best-effort: skip write-back for this row.
+                    logger.warning("GSheets write-back skipped (running event loop): %s", exc)
+                else:
+                    logger.warning("GSheets write-back error: %s", exc)
+            except Exception as exc:
+                logger.warning("GSheets write-back error for row %d: %s", er.row_index, exc)
+
+        # Attempt to initialise the Google Sheets session.
+        if sheets_url:
+            try:
+                _gs_session = asyncio.run(_gs_init())
+                if _gs_session is None:
+                    logger.warning(
+                        "GSheets: session could not be initialised — write-back disabled"
+                    )
+                    if execution_logger is not None:
+                        execution_logger.log_sync(
+                            "gsheets_init_failed",
+                            "warning",
+                            "Google Sheets write-back could not log in; continuing without it.",
+                        )
+                else:
+                    logger.info("GSheets: session ready for write-back")
+                    if execution_logger is not None:
+                        execution_logger.log_sync(
+                            "gsheets_ready",
+                            "info",
+                            "Google Sheets write-back session initialised.",
+                        )
+            except RuntimeError as exc:
+                if "cannot be called from a running event loop" in str(exc):
+                    logger.warning("GSheets: cannot init inside running event loop — disabled")
+                else:
+                    logger.warning("GSheets: init error — write-back disabled: %s", exc)
+            except Exception as exc:
+                logger.warning("GSheets: init error — write-back disabled: %s", exc)
+
+        # ── End Google Sheets init ────────────────────────────────────────────
+
         emit_monitor_phase("Execute started", f"{total} row(s)")
         if execution_logger is not None:
             execution_logger.log_sync(
@@ -2050,7 +2248,13 @@ def run_execute(
         rows_out: list[ExecuteRowResult] = []
         try:
             rows_iter = list(_iter_rows(grouped))
-            i = 0
+            i = max(0, start_from_row)
+            if i > 0 and execution_logger is not None:
+                execution_logger.log_sync(
+                    "execute_resumed",
+                    "pending",
+                    f"Resuming from row {i} of {len(rows_iter)}",
+                )
             while i < len(rows_iter):
                 action, row = rows_iter[i]
                 try:
@@ -2061,7 +2265,7 @@ def run_execute(
                             batch_rows.append(rows_iter[i][1])
                             i += 1
                         for er in _exec_seo_consecutive_playwright_batch(
-                            site, batch_rows, seo_plugin, spec
+                            site, batch_rows, seo_plugin, spec, execution_logger
                         ):
                             rows_out.append(er)
                             emit_monitor_row_exec(
@@ -2072,6 +2276,26 @@ def run_execute(
                                 er.message,
                             )
                             _log_row(er)
+                            _sheets_write_back(er)
+                        if execution_logger is not None:
+                            rows_completed = len(rows_out)
+                            execution_logger.set_rows_completed(rows_completed)
+                            if execution_logger.is_paused():
+                                execution_logger.log_sync(
+                                    "execute_paused",
+                                    "warning",
+                                    f"Paused after Playwright batch (completed {rows_completed} of {len(rows_iter)})",
+                                )
+                                execution_logger.mark_complete()
+                                return ExecuteResponse(
+                                    rows_processed=len(rows_out),
+                                    updated=sum(1 for r in rows_out if r.outcome == "updated"),
+                                    skipped=sum(1 for r in rows_out if r.outcome == "skipped"),
+                                    failed=sum(1 for r in rows_out if r.outcome == "failed"),
+                                    rows=rows_out,
+                                    paused=True,
+                                    rows_completed=rows_completed,
+                                )
                         continue
 
                     if action == "on_page":
@@ -2108,7 +2332,26 @@ def run_execute(
                     er.message,
                 )
                 _log_row(er)
+                _sheets_write_back(er)
                 i += 1
+                if execution_logger is not None:
+                    execution_logger.set_rows_completed(i)
+                    if execution_logger.is_paused():
+                        execution_logger.log_sync(
+                            "execute_paused",
+                            "warning",
+                            f"Paused after row {i} of {len(rows_iter)}",
+                        )
+                        execution_logger.mark_complete()
+                        return ExecuteResponse(
+                            rows_processed=len(rows_out),
+                            updated=sum(1 for r in rows_out if r.outcome == "updated"),
+                            skipped=sum(1 for r in rows_out if r.outcome == "skipped"),
+                            failed=sum(1 for r in rows_out if r.outcome == "failed"),
+                            rows=rows_out,
+                            paused=True,
+                            rows_completed=i,
+                        )
 
             updated = sum(1 for r in rows_out if r.outcome == "updated")
             skipped = sum(1 for r in rows_out if r.outcome == "skipped")
@@ -2135,5 +2378,11 @@ def run_execute(
         finally:
             if execution_logger is not None:
                 execution_logger.mark_complete()
+            # Close the Google Sheets Playwright session if it was opened.
+            if _gs_session is not None:
+                try:
+                    asyncio.run(_gs_close(_gs_session))
+                except Exception as exc:
+                    logger.debug("GSheets: session close error (non-critical): %s", exc)
     finally:
         current_monitor_execution_id.reset(token)
