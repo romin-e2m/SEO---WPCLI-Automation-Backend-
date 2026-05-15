@@ -63,11 +63,19 @@ async def run_qa(
             continue
 
     # Include updated and skipped rows — both represent a final WordPress state worth verifying
-    updated_rows = [r for r in all_rows if r.outcome in ("updated", "skipped")]
+    rows_to_verify = [r for r in all_rows if r.outcome in ("updated", "skipped")]
+
+    # Exclude skipped image rows — they have no attachment_id/media_id so cannot be verified
+    def should_verify(row: ExecuteRowResult) -> bool:
+        if row.action_type == "images" and row.outcome == "skipped":
+            return False
+        return True
+
+    rows_to_verify = [r for r in rows_to_verify if should_verify(r)]
 
     # Group by action_type
     grouped: dict[str, list[ExecuteRowResult]] = {}
-    for row in updated_rows:
+    for row in rows_to_verify:
         grouped.setdefault(row.action_type, []).append(row)
 
     # Build coroutines for each known action_type that has rows

@@ -12,6 +12,7 @@ from app.services.run_pipeline import run_dry_run, run_execute
 from app.services.wp_site import rest_client
 from app.services.execution_logger import ExecutionLogger
 from app.services.execution_log_registry import get as get_execution_logger, register as register_execution
+from app.services.excel_export import build_export_excel
 
 router = APIRouter(prefix="/api/run", tags=["run"])
 
@@ -143,7 +144,6 @@ def _run_execute_background(
             body.seo_plugin,
             execution_logger=execution,
             start_from_row=start_from_row,
-            sheets_url=body.sheets_url,
         )
     except Exception as e:
         execution.log_sync("execute_error", "error", str(e))
@@ -287,4 +287,33 @@ async def stream_execution_logs(execution_id: str):
         _log_stream_generator(execution_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/export/{execution_id}")
+def export_results(execution_id: str):
+    """Download an Excel file with all original row data and a trailing Status column."""
+    execution = get_execution_logger(execution_id)
+    if not execution:
+        raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
+
+    payload = execution.get_payload()
+    if not payload:
+        raise HTTPException(status_code=409, detail="No stored payload for this execution; cannot export")
+
+    try:
+        body = ExecuteRequest.model_validate(payload)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Stored payload invalid: {str(e)}") from e
+
+    row_results = execution.get_row_results()
+    excel_bytes = build_export_excel(body.grouped, row_results)
+
+    short_id = execution_id[:8]
+    filename = f"seo_results_{short_id}.xlsx"
+
+    return StreamingResponse(
+        iter([excel_bytes]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

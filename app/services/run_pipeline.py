@@ -2080,7 +2080,6 @@ def run_execute(
     seo_plugin: str | None = None,
     execution_logger: ExecutionLogger | None = None,
     start_from_row: int = 0,
-    sheets_url: str | None = None,
 ) -> ExecuteResponse:
     total = _count_grouped(grouped)
     limit = _max_run_rows()
@@ -2145,99 +2144,10 @@ def run_execute(
                 "current": current or None,
                 "updated": updated or None,
                 "message": er.message or None,
+                "post_id": er.post_id,
+                "attachment_id": er.attachment_id,
+                "detail": dict(er.detail) if er.detail else None,
             })
-
-        # ── Google Sheets write-back (optional) ──────────────────────────────
-        # Initialise a Playwright+Sheets session once if sheets_url is provided.
-        # The session stays open for the duration of the run; each row calls
-        # write_status after processing.  Errors never block the main loop.
-
-        _gs_session: tuple | None = None  # holds (playwright_ctx, browser, page, gs_instance)
-
-        async def _gs_init() -> tuple | None:
-            """Launch a Playwright browser and log into Google Sheets."""
-            from playwright.async_api import async_playwright
-            from app.services.gsheets_playwright import GoogleSheetsPlaywright
-
-            p = await async_playwright().start()
-            browser = await launch_chromium(p, headless=should_run_headless())
-            page = await browser.new_page()
-            gs = GoogleSheetsPlaywright(sheets_url)  # type: ignore[arg-type]
-            ok = await gs.login(page)
-            if not ok:
-                await browser.close()
-                await p.stop()
-                return None
-            return (p, browser, page, gs)
-
-        async def _gs_write(session: tuple, er: ExecuteRowResult) -> None:
-            """Write a single row status back to Google Sheets."""
-            _, _, page, gs = session
-            await gs.write_status(page, er.sheet_name, er.row_index, er.outcome, er.message)
-
-        async def _gs_close(session: tuple) -> None:
-            """Tear down the Playwright browser session."""
-            p, browser, _page, _gs = session
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            try:
-                await p.stop()
-            except Exception:
-                pass
-
-        def _sheets_write_back(er: ExecuteRowResult) -> None:
-            """
-            Synchronous wrapper called after each row result.
-            Errors are caught and logged — they never propagate to the main loop.
-            """
-            nonlocal _gs_session
-            if _gs_session is None:
-                return
-            try:
-                asyncio.run(_gs_write(_gs_session, er))
-            except RuntimeError as exc:
-                if "cannot be called from a running event loop" in str(exc):
-                    # Running inside an already-running loop (e.g. test harness).
-                    # Best-effort: skip write-back for this row.
-                    logger.warning("GSheets write-back skipped (running event loop): %s", exc)
-                else:
-                    logger.warning("GSheets write-back error: %s", exc)
-            except Exception as exc:
-                logger.warning("GSheets write-back error for row %d: %s", er.row_index, exc)
-
-        # Attempt to initialise the Google Sheets session.
-        if sheets_url:
-            try:
-                _gs_session = asyncio.run(_gs_init())
-                if _gs_session is None:
-                    logger.warning(
-                        "GSheets: session could not be initialised — write-back disabled"
-                    )
-                    if execution_logger is not None:
-                        execution_logger.log_sync(
-                            "gsheets_init_failed",
-                            "warning",
-                            "Google Sheets write-back could not log in; continuing without it.",
-                        )
-                else:
-                    logger.info("GSheets: session ready for write-back")
-                    if execution_logger is not None:
-                        execution_logger.log_sync(
-                            "gsheets_ready",
-                            "info",
-                            "Google Sheets write-back session initialised.",
-                        )
-            except RuntimeError as exc:
-                if "cannot be called from a running event loop" in str(exc):
-                    logger.warning("GSheets: cannot init inside running event loop — disabled")
-                else:
-                    logger.warning("GSheets: init error — write-back disabled: %s", exc)
-            except Exception as exc:
-                logger.warning("GSheets: init error — write-back disabled: %s", exc)
-
-        # ── End Google Sheets init ────────────────────────────────────────────
 
         emit_monitor_phase("Execute started", f"{total} row(s)")
         if execution_logger is not None:
@@ -2276,7 +2186,6 @@ def run_execute(
                                 er.message,
                             )
                             _log_row(er)
-                            _sheets_write_back(er)
                         if execution_logger is not None:
                             rows_completed = len(rows_out)
                             execution_logger.set_rows_completed(rows_completed)
@@ -2332,7 +2241,6 @@ def run_execute(
                     er.message,
                 )
                 _log_row(er)
-                _sheets_write_back(er)
                 i += 1
                 if execution_logger is not None:
                     execution_logger.set_rows_completed(i)
@@ -2378,11 +2286,5 @@ def run_execute(
         finally:
             if execution_logger is not None:
                 execution_logger.mark_complete()
-            # Close the Google Sheets Playwright session if it was opened.
-            if _gs_session is not None:
-                try:
-                    asyncio.run(_gs_close(_gs_session))
-                except Exception as exc:
-                    logger.debug("GSheets: session close error (non-critical): %s", exc)
     finally:
         current_monitor_execution_id.reset(token)

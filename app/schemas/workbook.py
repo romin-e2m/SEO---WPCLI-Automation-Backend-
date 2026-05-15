@@ -102,6 +102,10 @@ class NormalizedRow(BaseModel):
     sheet_name: str
     row_index: int = Field(description="1-based index in the sheet (excluding skipped headers).")
     values: dict[str, Any]
+    original_values: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Original header -> cell value pairs from the source Excel sheet (before canonical mapping).",
+    )
 
 
 class MappingNormalizeResponse(BaseModel):

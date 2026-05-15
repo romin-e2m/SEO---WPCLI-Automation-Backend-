@@ -355,80 +355,33 @@ class WordPressPlaywright:
     
     async def login(self, page: Page) -> bool:
         """
-        Log into WordPress admin panel with comprehensive error handling and visual feedback.
+        Log into WordPress admin panel with optimized performance.
+        Skips screenshots and reduces waits.
         
         Returns:
             True if login successful, False otherwise
         """
         try:
-            self.logger.add_log(
-                "🔐 Initiating WordPress Login",
-                "info",
-                f"URL: {self.admin_url}"
-            )
+            self.logger.add_log("🔐 WordPress Login", "info", "")
             
-            await page.goto(self.admin_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(500)
-            
-            screenshot_path = f"{SCREENSHOTS_DIR}/01_login_page_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            await page.screenshot(path=screenshot_path)
-            self.logger.add_screenshot(screenshot_path)
-            self.logger.add_log(
-                "📸 Login page screenshot captured",
-                "info",
-                screenshot_path
-            )
+            await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
             
             try:
                 await page.wait_for_url("**/wp-admin/", timeout=2000)
-                self.logger.add_log(
-                    "✅ Already logged into WordPress",
-                    "success"
-                )
+                self.logger.add_log("✅ Already logged in", "success", "")
                 return True
             except Exception:
                 pass
             
-            self.logger.add_log(
-                "📝 Filling login credentials",
-                "info",
-                "Username and password"
-            )
-            
-            username_field = await page.query_selector('input[name="log"]')
-            if not username_field:
-                username_field = await page.query_selector('input[type="text"]')
-            
-            password_field = await page.query_selector('input[name="pwd"]')
-            if not password_field:
-                password_field = await page.query_selector('input[type="password"]')
+            username_field = await page.query_selector('input[name="log"]') or await page.query_selector('input[type="text"]')
+            password_field = await page.query_selector('input[name="pwd"]') or await page.query_selector('input[type="password"]')
             
             if not username_field or not password_field:
-                self.logger.add_log(
-                    "❌ Login form not found",
-                    "error",
-                    "Could not locate username/password fields"
-                )
-                screenshot_path = f"{SCREENSHOTS_DIR}/02_login_form_not_found_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
+                self.logger.add_log("❌ Login form not found", "error", "")
                 return False
             
-            await username_field.click()
-            await page.wait_for_timeout(100)
             await username_field.fill(self.username)
-            await page.wait_for_timeout(100)
-            
-            await password_field.click()
-            await page.wait_for_timeout(100)
             await password_field.fill(self.password)
-            await page.wait_for_timeout(100)
-            
-            self.logger.add_log(
-                "🖱️  Clicking login button",
-                "info",
-                "Credentials filled, submitting form"
-            )
             
             login_button = await page.query_selector('button[type="submit"], input[type="submit"]')
             if login_button:
@@ -436,32 +389,12 @@ class WordPressPlaywright:
             else:
                 await page.press('input[type="password"]', 'Enter')
             
-            await page.wait_for_url("**/wp-admin/", timeout=15000)
-            await page.wait_for_timeout(500)
-            
-            screenshot_path = f"{SCREENSHOTS_DIR}/03_login_success_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            await page.screenshot(path=screenshot_path)
-            self.logger.add_screenshot(screenshot_path)
-            
-            self.logger.add_log(
-                "✅ Successfully logged into WordPress",
-                "success",
-                "Ready to perform tasks"
-            )
+            await page.wait_for_url("**/wp-admin/", timeout=12000)
+            self.logger.add_log("✅ Login successful", "success", "")
             return True
             
         except Exception as e:
-            self.logger.add_log(
-                "❌ Login failed",
-                "error",
-                str(e)
-            )
-            try:
-                screenshot_path = f"{SCREENSHOTS_DIR}/error_login_failed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-            except Exception:
-                pass
+            self.logger.add_log("❌ Login failed", "error", str(e)[:60])
             logger.error(f"WordPress login failed: {e}")
             return False
     
@@ -848,24 +781,16 @@ class WordPressPlaywright:
                 "screenshots": self.logger.get_screenshots()
             }
 
-    async def _safe_scroll_into_view(self, page: Page, target, *, timeout_ms: int = 5000) -> None:
-        """
-        Scroll into view without burning the page default timeout (45s/90s in light_mode).
-
-        Gutenberg metabox roots often sit in nested scroll containers; Playwright's
-        scroll_into_view_if_needed can retry until the full default timeout even when
-        the node is attached. Prefer a short timeout, then native scrollIntoView.
-        """
+    async def _safe_scroll_into_view(self, page: Page, target, *, timeout_ms: int = 2000) -> None:
+        """Scroll into view with short timeout."""
         try:
             await target.scroll_into_view_if_needed(timeout=timeout_ms)
         except Exception:
             try:
-                await target.evaluate(
-                    "el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})"
-                )
+                await target.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})")
             except Exception:
                 pass
-        await page.wait_for_timeout(80)
+        await page.wait_for_timeout(50)
 
     async def _ensure_yoast_metabox_open(self, page: Page) -> None:
         """Expand classic Yoast postbox if WordPress left it closed (snippet fields stay display:none)."""
@@ -933,17 +858,15 @@ class WordPressPlaywright:
         return cells.last if n else None
 
     async def _focus_yoast_contenteditable(self, page: Page, loc) -> None:
-        """Focus snippet field: force-click first, then JS focus (avoids visible-only click waits)."""
+        """Focus snippet field efficiently."""
         try:
-            await loc.click(force=True, timeout=2500)
-            return
+            await loc.click(force=True, timeout=2000)
         except Exception:
-            pass
-        try:
-            await loc.evaluate("el => { el.focus(); }")
-            await page.wait_for_timeout(120)
-        except Exception:
-            pass
+            try:
+                await loc.evaluate("el => { el.focus(); }")
+                await page.wait_for_timeout(50)
+            except Exception:
+                pass
 
     async def _set_contenteditable_text_react(
         self, loc, text: str
@@ -1063,55 +986,57 @@ class WordPressPlaywright:
 
     async def _fill_seo_meta_description(self, page: Page, meta_description: str) -> bool:
         """
-        Fill meta description in Yoast SEO metabox.
-        First tries to update the actual input field, then falls back to snippet preview.
+        Fill meta description with comprehensive selector fallbacks.
         """
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(100)
         await self._scroll_to_block_editor_metaboxes(page)
         await self._ensure_yoast_metabox_open(page)
         await self._open_yoast_sidebar_tab_if_present(page)
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(300)
 
-        # FIRST: Try to fill the Draft.js contenteditable field directly
-        # Yoast uses Draft.js for the snippet editor, which uses contenteditable divs
         try:
-            # Direct ID selector for Yoast's meta description Draft.js editor
-            meta_desc_field = page.locator("#yoast-google-preview-description-metabox").first
-            if await meta_desc_field.count() > 0:
-                await self._safe_scroll_into_view(page, meta_desc_field)
-                await page.wait_for_timeout(100)
-                
-                # Click to focus the field
-                await meta_desc_field.click(force=True)
-                await page.wait_for_timeout(200)
-                
-                # Select all content using Ctrl+A keyboard shortcut
-                await page.keyboard.press('Control+A')
-                await page.wait_for_timeout(100)
-                
-                # Delete selected content using Delete key
-                await page.keyboard.press('Delete')
-                await page.wait_for_timeout(200)
-                
-                # Type the new content with slow typing (delay=5ms per char) so Draft.js can process
-                await page.keyboard.type(meta_description, delay=5)
-                await page.wait_for_timeout(300)
-                
-                # Trigger blur event to finalize the change
-                await meta_desc_field.evaluate("el => el.blur()")
-                await page.wait_for_timeout(200)
-                
-                self.logger.add_log(
-                    "✅ Meta description filled (keyboard: Ctrl+A → Delete → Type)",
-                    "success",
-                    f"{len(meta_description)} chars",
-                )
-                return True
-        except Exception as e:
-            self.logger.add_log(f"Keyboard method failed: {str(e)[:50]}", "debug", "")
+            await page.locator("#yoast-google-preview-description-metabox").first.wait_for(
+                state="attached", timeout=15000
+            )
+        except Exception:
             pass
-        
-        # Fallback: Try direct field selectors
+
+        try:
+            loc = await self._resolve_yoast_google_preview_cell(page, "yoast-google-preview-description-metabox")
+            if loc:
+                is_visible = await loc.is_visible()
+                if is_visible:
+                    await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                    await self._focus_yoast_contenteditable(page, loc)
+                    await page.wait_for_timeout(100)
+
+                    await page.keyboard.press('Control+A')
+                    await page.keyboard.press('Delete')
+                    await page.keyboard.type(meta_description, delay=1)
+                    await page.wait_for_timeout(200)
+                    final_text = await loc.inner_text()
+                    if meta_description.strip() in final_text.strip() or final_text.strip() in meta_description.strip():
+                        pass
+                    else:
+                        try:
+                            await self._set_contenteditable_text_react(loc, meta_description)
+                            await page.wait_for_timeout(200)
+                        except Exception:
+                            pass
+                        final_text2 = await loc.inner_text()
+                        if meta_description.strip() not in final_text2.strip() and final_text2.strip() not in meta_description.strip():
+                            logger.warning("Meta description content mismatch after typing: expected %r, got %r", meta_description[:80], final_text2[:80])
+                    await loc.evaluate("""(el) => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }""")
+
+                    self.logger.add_log("✅ Meta description filled (preview)", "success", f"{len(meta_description)} chars")
+                    return True
+        except Exception:
+            pass
+
         actual_input_selectors = [
             "textarea[name='_yoast_wpseo_metadesc']",
             "input[name='_yoast_wpseo_metadesc']",
@@ -1119,135 +1044,45 @@ class WordPressPlaywright:
             "input#yoast_wpseo_metadesc",
             "textarea[name='rank_math_description']",
             "input[name='rank_math_description']",
-            "[role='textbox'][aria-label*='description']",
+            "#wpseo_meta textarea",
+            "#wpseo_meta input",
             "textarea[placeholder*='description' i]",
             "input[placeholder*='description' i]",
         ]
-        
+
         for selector in actual_input_selectors:
             try:
                 loc = page.locator(selector).first
                 if await loc.count() > 0:
-                    # Make sure it's visible and not the focus keyphrase field
                     is_visible = await loc.is_visible()
                     if not is_visible:
                         continue
-                    
-                    await self._safe_scroll_into_view(page, loc)
-                    await page.wait_for_timeout(100)
-                    await loc.click(timeout=5000)
-                    await loc.fill(meta_description, timeout=15000, force=True)
-                    
-                    # Trigger change events
-                    await loc.evaluate("""(el) => {
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.dispatchEvent(new Event('blur', { bubbles: true }));
-                    }""")
-                    await page.wait_for_timeout(200)
-                    
-                    self.logger.add_log(
-                        "✅ Meta description filled (actual input field)",
-                        "success",
-                        f"{len(meta_description)} chars via {selector}",
-                    )
-                    return True
+
+                    try:
+                        await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                    except Exception:
+                        pass
+
+                    try:
+                        await loc.fill(meta_description, timeout=8000)
+                        await loc.evaluate("""(el) => {
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.dispatchEvent(new Event('blur', { bubbles: true }));
+                        }""")
+                        self.logger.add_log("✅ Meta description filled", "success", f"{len(meta_description)} chars")
+                        return True
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
-        # FALLBACK: Try updating the snippet preview (visual representation)
-        try:
-            await page.locator("#yoast-google-preview-description-metabox").first.wait_for(
-                state="attached", timeout=15000
-            )
-            self.logger.add_log("✓ Yoast meta field is present in DOM", "debug", "")
-        except Exception:
-            self.logger.add_log(
-                f"Timeout waiting for Yoast field",
-                "warning",
-                ""
-            )
-
-        try:
-            loc = await self._resolve_yoast_google_preview_cell(
-                page, "yoast-google-preview-description-metabox"
-            )
-            
-            if loc is None:
-                return False
-            
-            self.logger.add_log("🎯 Found meta description preview field", "info", "div#yoast-google-preview-description-metabox")
-            
-            # Scroll into view
-            await self._safe_scroll_into_view(page, loc)
-            await page.wait_for_timeout(250)
-            
-            # Click to focus
-            await self._focus_yoast_contenteditable(page, loc)
-            
-            await page.wait_for_timeout(150)
-            
-            # Try using the React/JS method first
-            if await self._set_contenteditable_text_react(loc, meta_description):
-                self.logger.add_log(
-                    "✅ Meta description filled (snippet preview - React/JS method)",
-                    "success",
-                    f"{len(meta_description)} chars",
-                )
-                await page.wait_for_timeout(300)
-                return True
-            
-            # Fallback: Clear and type manually
-            await page.keyboard.press('Control+A')
-            await page.wait_for_timeout(50)
-            await page.keyboard.press('Delete')
-            await page.wait_for_timeout(100)
-            
-            current = await loc.inner_text()
-            if current.strip():
-                await loc.evaluate('el => { el.textContent = ""; }')
-                await page.wait_for_timeout(100)
-            
-            await page.keyboard.type(meta_description, delay=1)
-            await page.wait_for_timeout(300)
-            
-            # Trigger input and change events
-            await loc.evaluate("""(el) => {
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-            }""")
-            await page.wait_for_timeout(200)
-            
-            final_text = await loc.inner_text()
-            
-            if meta_description.strip() == final_text.strip() or meta_description in final_text:
-                self.logger.add_log(
-                    "✅ Meta description filled (snippet preview - keyboard method)",
-                    "success",
-                    f"{len(final_text)} chars",
-                )
-                return True
-            else:
-                self.logger.add_log(
-                    "⚠️ Content mismatch in snippet preview",
-                    "warning",
-                    f"Expected {len(meta_description)}, got {len(final_text)}",
-                )
-                return True
-        
-        except Exception as e:
-            self.logger.add_log(
-                f"Exception updating snippet preview: {str(e)[:80]}",
-                "error",
-                ""
-            )
-            return False
+        return False
 
     async def _fill_seo_meta_description_fallback(self, page: Page, meta_description: str) -> bool:
         """
         Fallback for older Yoast versions or different DOM structures.
-        Tries textarea selectors.
+        Tries textarea selectors with extended options.
         """
         selectors = [
             "#wpseo_meta textarea#yoast_wpseo_metadesc",
@@ -1257,6 +1092,9 @@ class WordPressPlaywright:
             "textarea[name='_yoast_wpseo_metadesc']",
             "#rank_math_description",
             "textarea[name='rank_math_description']",
+            ".wpseo-meta-description textarea",
+            "[data-test-id*='description'] textarea",
+            "[data-test-id*='description'] input",
         ]
 
         for sel in selectors:
@@ -1265,14 +1103,26 @@ class WordPressPlaywright:
                 if await loc.count() == 0:
                     continue
                 
-                await self._safe_scroll_into_view(page, loc)
-                await page.wait_for_timeout(100)
+                is_visible = await loc.is_visible()
+                if not is_visible:
+                    continue
+                
+                try:
+                    await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                except Exception:
+                    pass
                 
                 await loc.click(timeout=5000)
                 await loc.fill(meta_description, timeout=15000, force=True)
                 
+                await loc.evaluate("""(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""")
+                
                 self.logger.add_log(
-                    "✅ Meta description filled via textarea",
+                    "✅ Meta description filled (fallback)",
                     "success",
                     sel,
                 )
@@ -1283,55 +1133,56 @@ class WordPressPlaywright:
         return False
 
     async def _fill_seo_meta_title(self, page: Page, meta_title: str) -> bool:
-        """Fill SEO title in Yoast/Rank Math. First tries actual input field, then snippet preview."""
-        await page.wait_for_timeout(200)
+        """Fill SEO title with comprehensive selector fallbacks."""
+        await page.wait_for_timeout(100)
         await self._scroll_to_block_editor_metaboxes(page)
         await self._ensure_yoast_metabox_open(page)
         await self._open_yoast_sidebar_tab_if_present(page)
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(300)
 
-        self.logger.add_log("📦 Locating SEO title field", "info", "")
-
-        # FIRST: Try to fill the Draft.js contenteditable field directly
-        # Yoast uses Draft.js for the snippet editor, which uses contenteditable divs
         try:
-            # Direct ID selector for Yoast's SEO title Draft.js editor
-            seo_title_field = page.locator("#yoast-google-preview-title-metabox").first
-            if await seo_title_field.count() > 0:
-                await self._safe_scroll_into_view(page, seo_title_field)
-                await page.wait_for_timeout(100)
-                
-                # Click to focus the field
-                await seo_title_field.click(force=True)
-                await page.wait_for_timeout(200)
-                
-                # Select all content using Ctrl+A keyboard shortcut
-                await page.keyboard.press('Control+A')
-                await page.wait_for_timeout(100)
-                
-                # Delete selected content using Delete key
-                await page.keyboard.press('Delete')
-                await page.wait_for_timeout(200)
-                
-                # Type the new content with slow typing (delay=5ms per char) so Draft.js can process
-                await page.keyboard.type(meta_title, delay=5)
-                await page.wait_for_timeout(300)
-                
-                # Trigger blur event to finalize the change
-                await seo_title_field.evaluate("el => el.blur()")
-                await page.wait_for_timeout(200)
-                
-                self.logger.add_log(
-                    "✅ SEO title filled (keyboard: Ctrl+A → Delete → Type)",
-                    "success",
-                    f"{len(meta_title)} chars",
-                )
-                return True
-        except Exception as e:
-            self.logger.add_log(f"Keyboard method failed: {str(e)[:50]}", "debug", "")
+            await page.locator("#yoast-google-preview-title-metabox").first.wait_for(
+                state="attached", timeout=15000
+            )
+        except Exception:
             pass
-        
-        # Fallback: Try direct field selectors
+
+        try:
+            loc = await self._resolve_yoast_google_preview_cell(page, "yoast-google-preview-title-metabox")
+            if loc:
+                is_visible = await loc.is_visible()
+                if is_visible:
+                    await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                    await self._focus_yoast_contenteditable(page, loc)
+                    await page.wait_for_timeout(100)
+
+                    await page.keyboard.press('Control+A')
+                    await page.keyboard.press('Delete')
+                    await page.keyboard.type(meta_title, delay=1)
+                    await page.wait_for_timeout(200)
+                    final_text = await loc.inner_text()
+                    if meta_title.strip() in final_text.strip() or final_text.strip() in meta_title.strip():
+                        pass
+                    else:
+                        try:
+                            await self._set_contenteditable_text_react(loc, meta_title)
+                            await page.wait_for_timeout(200)
+                        except Exception:
+                            pass
+                        final_text2 = await loc.inner_text()
+                        if meta_title.strip() not in final_text2.strip() and final_text2.strip() not in meta_title.strip():
+                            logger.warning("SEO title content mismatch after typing: expected %r, got %r", meta_title[:80], final_text2[:80])
+                    await loc.evaluate("""(el) => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }""")
+
+                    self.logger.add_log("✅ SEO title filled (preview)", "success", f"{len(meta_title)} chars")
+                    return True
+        except Exception:
+            pass
+
         actual_input_selectors = [
             "input[name='_yoast_wpseo_title']",
             "input#yoast_wpseo_title",
@@ -1339,115 +1190,40 @@ class WordPressPlaywright:
             "textarea#yoast_wpseo_title",
             "input[name='rank_math_title']",
             "input#rank_math_title",
-            "textarea[name='rank_math_title']",
-            "[role='textbox'][aria-label*='title' i]",
+            "#wpseo_meta input[type='text']",
+            "#wpseo_meta textarea",
             "input[placeholder*='title' i]",
             "textarea[placeholder*='title' i]",
         ]
-        
+
         for selector in actual_input_selectors:
             try:
                 loc = page.locator(selector).first
                 if await loc.count() > 0:
-                    # Make sure it's visible and not the focus keyphrase field
                     is_visible = await loc.is_visible()
                     if not is_visible:
                         continue
-                    
-                    await self._safe_scroll_into_view(page, loc)
-                    await page.wait_for_timeout(100)
-                    await loc.click(timeout=5000)
-                    await loc.fill(meta_title, timeout=15000, force=True)
-                    
-                    # Trigger change events
-                    await loc.evaluate("""(el) => {
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.dispatchEvent(new Event('blur', { bubbles: true }));
-                    }""")
-                    await page.wait_for_timeout(200)
-                    
-                    self.logger.add_log(
-                        "✅ SEO title filled (actual input field)",
-                        "success",
-                        f"{len(meta_title)} chars via {selector}",
-                    )
-                    return True
+
+                    try:
+                        await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                    except Exception:
+                        pass
+
+                    try:
+                        await loc.fill(meta_title, timeout=8000)
+                        await loc.evaluate("""(el) => {
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.dispatchEvent(new Event('blur', { bubbles: true }));
+                        }""")
+                        self.logger.add_log("✅ SEO title filled", "success", f"{len(meta_title)} chars")
+                        return True
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
-        # FALLBACK: Try updating the snippet preview (visual representation)
-        try:
-            await page.locator("#yoast-google-preview-title-metabox").first.wait_for(
-                state="attached", timeout=15000
-            )
-        except Exception:
-            self.logger.add_log("Timeout waiting for Yoast SEO title field", "warning", "")
-
-        try:
-            loc = await self._resolve_yoast_google_preview_cell(
-                page, "yoast-google-preview-title-metabox"
-            )
-            if loc is None:
-                return False
-
-            self.logger.add_log(
-                "🎯 Found SEO title preview field",
-                "info",
-                "div#yoast-google-preview-title-metabox",
-            )
-            await self._safe_scroll_into_view(page, loc)
-            await page.wait_for_timeout(250)
-            await self._focus_yoast_contenteditable(page, loc)
-            await page.wait_for_timeout(150)
-            
-            # Try using the React/JS method first
-            if await self._set_contenteditable_text_react(loc, meta_title):
-                self.logger.add_log(
-                    "✅ SEO title filled (snippet preview - React/JS method)",
-                    "success",
-                    f"{len(meta_title)} chars",
-                )
-                await page.wait_for_timeout(300)
-                return True
-            
-            # Fallback: Clear and type manually
-            await page.keyboard.press("Control+A")
-            await page.wait_for_timeout(50)
-            await page.keyboard.press("Delete")
-            await page.wait_for_timeout(100)
-            current = await loc.inner_text()
-            if current.strip():
-                await loc.evaluate("el => { el.textContent = ''; }")
-                await page.wait_for_timeout(100)
-            await page.keyboard.type(meta_title, delay=1)
-            await page.wait_for_timeout(300)
-            
-            # Trigger input and change events
-            await loc.evaluate("""(el) => {
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-            }""")
-            await page.wait_for_timeout(200)
-            
-            final_text = await loc.inner_text()
-            if meta_title.strip() == final_text.strip() or meta_title in final_text:
-                self.logger.add_log(
-                    "✅ SEO title filled (snippet preview - keyboard method)",
-                    "success",
-                    f"{len(final_text)} chars",
-                )
-                return True
-            self.logger.add_log(
-                "⚠️ SEO title content mismatch in snippet preview",
-                "warning",
-                f"Expected {len(meta_title)}, got {len(final_text)}",
-            )
-            return True
-        except Exception as e:
-            self.logger.add_log(f"Exception updating snippet preview: {str(e)[:80]}", "error", "")
-            return False
+        return False
 
     async def _fill_seo_meta_title_fallback(self, page: Page, meta_title: str) -> bool:
         """Fallback: classic Yoast / Rank Math input fields for SEO title."""
@@ -1458,17 +1234,35 @@ class WordPressPlaywright:
             "input[name='_yoast_wpseo_title']",
             "#rank_math_title",
             "input[name='rank_math_title']",
+            ".wpseo-meta-title input",
+            "[data-test-id*='title'] input",
+            "#wpseo_meta textarea[name='_yoast_wpseo_title']",
         ]
         for sel in selectors:
             loc = page.locator(sel).first
             try:
                 if await loc.count() == 0:
                     continue
-                await self._safe_scroll_into_view(page, loc)
-                await page.wait_for_timeout(100)
+                
+                is_visible = await loc.is_visible()
+                if not is_visible:
+                    continue
+                
+                try:
+                    await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                except Exception:
+                    pass
+                
                 await loc.click(timeout=5000)
                 await loc.fill(meta_title, timeout=15000, force=True)
-                self.logger.add_log("✅ SEO title filled via input", "success", sel)
+                
+                await loc.evaluate("""(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""")
+                
+                self.logger.add_log("✅ SEO title filled (fallback)", "success", sel)
                 return True
             except Exception:
                 continue
@@ -1571,128 +1365,59 @@ class WordPressPlaywright:
         shot_prefix_editor: str,
         editor_loaded_log: str,
     ) -> tuple[str, dict[str, Any] | None]:
-        """Open the block editor for the SEO metabox. Returns ``(page_slug, None)`` or ``("", error)``."""
-        nav_ms = 45000 if light_mode else 90000
+        """Open editor with proper Yoast load detection."""
+        nav_ms = 30000 if light_mode else 45000
         page.set_default_timeout(nav_ms)
-        page.set_default_navigation_timeout(nav_ms)
 
-        self.logger.add_log(start_log_message, "info", page_url)
+        self.logger.add_log(start_log_message, "info", "")
 
         parsed = urlparse(page_url)
         page_path = parsed.path.strip("/")
         page_slug = page_path.split("/")[-1] if page_path else ""
 
-        self.logger.add_log(
-            "🔍 Resolved target",
-            "info",
-            f"slug={page_slug!r} post_id={post_id}",
-        )
+        self.logger.add_log("🔍 Resolved", "info", f"slug={page_slug!r}")
 
         if post_id is not None:
-            edit_url = urljoin(
-                self.admin_url, f"post.php?post={int(post_id)}&action=edit"
-            )
-            self.logger.add_log(
-                "🌐 Opening editor by post ID (REST-matched URL)",
-                "info",
-                edit_url,
-            )
+            edit_url = urljoin(self.admin_url, f"post.php?post={int(post_id)}&action=edit")
+            self.logger.add_log("🌐 Opening editor", "info", edit_url)
             await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
-            post_nav_wait = 350 if light_mode else 900
-            await page.wait_for_timeout(post_nav_wait)
+            await page.wait_for_timeout(500)
             try:
                 await page.wait_for_selector(
-                    "#wpseo_meta, .edit-post-layout__metaboxes",
+                    "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
                     state="attached",
-                    timeout=15000 if light_mode else 20000,
+                    timeout=15000,
                 )
             except Exception:
                 pass
+            await page.wait_for_timeout(500)
         else:
             if not page_slug:
-                return (
-                    "",
-                    {
-                        "status": "failed",
-                        "error": "No post_id and URL has no path segment to match.",
-                        "logs": self.logger.get_logs(),
-                        "screenshots": self.logger.get_screenshots(),
-                    },
-                )
+                return ("", {"status": "failed", "error": "No post_id and no URL path segment"})
 
-            list_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            list_shot = f"{SCREENSHOTS_DIR}/{shot_prefix_pages_list}_{list_ts}.png"
-
-            page_link = await self._find_row_title_in_list(
-                page, page_slug, post_type="page"
-            )
+            page_link = await self._find_row_title_in_list(page, page_slug, post_type="page")
             if page_link is None:
-                self.logger.add_log(
-                    "📋 Not in pages list; trying posts",
-                    "info",
-                    page_slug,
-                )
-                page_link = await self._find_row_title_in_list(
-                    page, page_slug, post_type="post"
-                )
-
-            await page.screenshot(path=list_shot)
-            self.logger.add_screenshot(list_shot)
+                page_link = await self._find_row_title_in_list(page, page_slug, post_type="post")
 
             if page_link is None:
-                all_pages_text: list[str] = []
-                for link in await page.query_selector_all("a.row-title"):
-                    text = (await link.text_content() or "").strip()
-                    all_pages_text.append(text)
-                pages_summary = (
-                    ", ".join(all_pages_text[:10]) if all_pages_text else "No items"
-                )
-                if len(all_pages_text) > 10:
-                    pages_summary += f", and {len(all_pages_text) - 10} more..."
-                self.logger.add_log(
-                    "❌ Content not found",
-                    "error",
-                    f"slug={page_slug!r} | {pages_summary}",
-                )
-                nf_shot = (
-                    f"{SCREENSHOTS_DIR}/{shot_prefix_not_found}_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=nf_shot)
-                self.logger.add_screenshot(nf_shot)
-                return (
-                    "",
-                    {
-                        "status": "failed",
-                        "error": (
-                            f"Content for slug '{page_slug}' not found in WordPress "
-                            f"pages or posts lists. Available (last list): {pages_summary}"
-                        ),
-                        "logs": self.logger.get_logs(),
-                        "screenshots": self.logger.get_screenshots(),
-                    },
-                )
+                return ("", {"status": "failed", "error": f"Content not found for slug '{page_slug}'"})
 
-            self.logger.add_log(
-                "✅ Matched list row; opening editor",
-                "success",
-                page_slug,
-            )
+            self.logger.add_log("✅ Matched; opening editor", "success", page_slug)
             try:
-                await self._safe_scroll_into_view(page, page_link)
-                await page.wait_for_timeout(300)
+                await self._safe_scroll_into_view(page, page_link, timeout_ms=2000)
             except Exception:
                 pass
-            await page_link.click(timeout=15000)
-            await page.wait_for_timeout(800 if light_mode else 1500)
-
-        if not light_mode:
-            editor_shot = (
-                f"{SCREENSHOTS_DIR}/{shot_prefix_editor}_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            )
-            await page.screenshot(path=editor_shot)
-            self.logger.add_screenshot(editor_shot)
+            await page_link.click(timeout=10000)
+            await page.wait_for_timeout(800)
+            try:
+                await page.wait_for_selector(
+                    "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
+                    state="attached",
+                    timeout=15000,
+                )
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
 
         self.logger.add_log(editor_loaded_log, "success", "")
         return (page_slug, None)
@@ -1706,26 +1431,18 @@ class WordPressPlaywright:
         *,
         light_mode: bool = False,
     ) -> dict[str, Any]:
-        """
-        Update SEO meta description in the post editor.
-
-        When ``post_id`` is set (same ID as REST ``resolve_post_url`` / dry-run), opens
-        ``post.php?post=ID&action=edit`` so **posts** (e.g. hello-world) and **pages**
-        with marketing titles are handled without list-table slug guessing.
-
-        ``light_mode``: fewer screenshots and shorter waits (used for batched meta runs).
-        """
+        """Update SEO meta description with light mode enabled for speed."""
         try:
             page_slug, prep_err = await self._prepare_seo_post_editor(
                 page,
                 page_url,
                 post_id,
                 light_mode=light_mode,
-                start_log_message="📝 Updating meta description",
+                start_log_message="📝 Meta description",
                 shot_prefix_pages_list="07_pages_list",
                 shot_prefix_not_found="page_not_found",
                 shot_prefix_editor="08_page_editor",
-                editor_loaded_log="✅ Editor loaded; filling SEO meta",
+                editor_loaded_log="✅ Editor ready",
             )
             if prep_err:
                 return prep_err
@@ -1735,78 +1452,26 @@ class WordPressPlaywright:
                 filled = await self._fill_seo_meta_description_fallback(page, meta_description)
             
             if not filled:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/meta_field_not_found_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-                return {
-                    "status": "failed",
-                    "error": "Meta description field not found (Yoast/Rank Math).",
-                    "logs": self.logger.get_logs(),
-                    "screenshots": self.logger.get_screenshots(),
-                }
-
-            if not light_mode:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/09_meta_filled_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
+                return {"status": "failed", "error": "Meta description field not found"}
 
             if not await self._click_save_post_editor(page):
-                self.logger.add_log(
-                    "⚠️  Could not click save; meta may be unsaved",
-                    "warning",
-                    "",
-                )
+                self.logger.add_log("⚠️ Could not click save", "warning", "")
 
-            await page.wait_for_timeout(900 if light_mode else 2500)
+            await page.wait_for_timeout(600)
 
-            if not light_mode:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/10_meta_saved_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-
-            self.logger.add_log(
-                "✅ Meta description flow complete",
-                "success",
-                page_slug or str(post_id),
-            )
+            self.logger.add_log("✅ Meta description complete", "success", page_slug or str(post_id))
 
             return {
                 "status": "updated",
                 "page_url": page_url,
                 "meta_description": meta_description,
                 "post_id": post_id,
-                "logs": self.logger.get_logs(),
-                "screenshots": self.logger.get_screenshots(),
             }
 
         except Exception as e:
-            self.logger.add_log(
-                "❌ Meta update failed",
-                "error",
-                str(e)
-            )
-            try:
-                screenshot_path = f"{SCREENSHOTS_DIR}/error_meta_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-            except Exception:
-                pass
+            self.logger.add_log("❌ Meta update failed", "error", str(e)[:60])
             logger.error(f"Failed to update meta description: {e}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "logs": self.logger.get_logs(),
-                "screenshots": self.logger.get_screenshots()
-            }
+            return {"status": "failed", "error": str(e)}
 
     async def update_meta_title(
         self,
@@ -1817,18 +1482,18 @@ class WordPressPlaywright:
         *,
         light_mode: bool = False,
     ) -> dict[str, Any]:
-        """Update SEO title in the post editor (same navigation flow as ``update_meta_description``)."""
+        """Update SEO title with light mode enabled for speed."""
         try:
             page_slug, prep_err = await self._prepare_seo_post_editor(
                 page,
                 page_url,
                 post_id,
                 light_mode=light_mode,
-                start_log_message="📝 Updating SEO title",
+                start_log_message="📝 SEO title",
                 shot_prefix_pages_list="07_pages_list_title",
                 shot_prefix_not_found="page_not_found_title",
                 shot_prefix_editor="08_page_editor_title",
-                editor_loaded_log="✅ Editor loaded; filling SEO title",
+                editor_loaded_log="✅ Editor ready",
             )
             if prep_err:
                 return prep_err
@@ -1837,74 +1502,23 @@ class WordPressPlaywright:
             if not filled:
                 filled = await self._fill_seo_meta_title_fallback(page, meta_title)
             if not filled:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/meta_title_field_not_found_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-                return {
-                    "status": "failed",
-                    "error": "SEO title field not found (Yoast/Rank Math).",
-                    "logs": self.logger.get_logs(),
-                    "screenshots": self.logger.get_screenshots(),
-                }
-
-            if not light_mode:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/09_meta_title_filled_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
+                return {"status": "failed", "error": "SEO title field not found"}
 
             if not await self._click_save_post_editor(page):
-                self.logger.add_log(
-                    "⚠️  Could not click save; SEO title may be unsaved",
-                    "warning",
-                    "",
-                )
+                self.logger.add_log("⚠️ Could not click save", "warning", "")
 
-            await page.wait_for_timeout(900 if light_mode else 2500)
+            await page.wait_for_timeout(600)
 
-            if not light_mode:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/10_meta_title_saved_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-
-            self.logger.add_log(
-                "✅ SEO title flow complete",
-                "success",
-                page_slug or str(post_id),
-            )
+            self.logger.add_log("✅ SEO title complete", "success", page_slug or str(post_id))
 
             return {
                 "status": "updated",
                 "page_url": page_url,
                 "meta_title": meta_title,
                 "post_id": post_id,
-                "logs": self.logger.get_logs(),
-                "screenshots": self.logger.get_screenshots(),
             }
 
         except Exception as e:
-            self.logger.add_log("❌ SEO title update failed", "error", str(e))
-            try:
-                screenshot_path = (
-                    f"{SCREENSHOTS_DIR}/error_meta_title_update_"
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                )
-                await page.screenshot(path=screenshot_path)
-                self.logger.add_screenshot(screenshot_path)
-            except Exception:
-                pass
+            self.logger.add_log("❌ SEO title failed", "error", str(e)[:60])
             logger.error(f"Failed to update SEO title: {e}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "logs": self.logger.get_logs(),
-                "screenshots": self.logger.get_screenshots(),
-            }
+            return {"status": "failed", "error": str(e)}

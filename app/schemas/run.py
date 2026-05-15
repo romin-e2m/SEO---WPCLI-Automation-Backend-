@@ -53,10 +53,6 @@ class DryRunRequest(RunGroupedPayload):
         default=None,
         description="Optional client UUID so the UI can subscribe to SSE before the run completes.",
     )
-    sheets_url: str | None = Field(
-        default=None,
-        description="Google Sheets URL for status write-back (dry-run; reserved for future use).",
-    )
 
     @field_validator("dry_run_id")
     @classmethod
@@ -106,10 +102,6 @@ class ExecuteRequest(RunGroupedPayload):
     execution_id: str | None = Field(
         default=None,
         description="Optional client-generated UUID so UIs can subscribe to logs before the run completes.",
-    )
-    sheets_url: str | None = Field(
-        default=None,
-        description="Google Sheets URL for status write-back after each row is processed.",
     )
 
     @field_validator("execution_id")
