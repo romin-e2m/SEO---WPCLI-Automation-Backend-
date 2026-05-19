@@ -1,10 +1,20 @@
 """
 WordPress automation via Playwright for UI-based operations.
 Handles 301 redirects and meta descriptions through WordPress admin panel.
+
+Pause/Resume Integration Notes:
+- PauseController is passed through _exec_seo_playwright_batch_run
+- Use: await pause_ctrl.wait_if_paused() before major browser operations
+- Key checkpoint locations:
+  1. Before login (before page.goto)
+  2. Before navigating to edit page
+  3. Before filling form fields
+  4. Before saving/submitting
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -333,9 +343,12 @@ class WordPressPlaywright:
     """
     Automates WordPress admin panel operations using Playwright.
     Supports 301 redirects and meta description updates.
+    
+    Optional pause_controller for fine-grained pause/resume at action level.
+    Pass pause_ctrl to enable pause checks before major operations.
     """
     
-    def __init__(self, admin_url: str, username: str, password: str):
+    def __init__(self, admin_url: str, username: str, password: str, pause_ctrl: Any = None, execution_logger: Any = None):
         """
         Initialize WordPress Playwright automation.
         
@@ -343,60 +356,95 @@ class WordPressPlaywright:
             admin_url: WordPress admin panel URL (e.g., http://example.com/wp-admin/)
             username: WordPress username
             password: WordPress password
+            pause_ctrl: Optional PauseController for action-level pause checkpoints
+            execution_logger: Optional ExecutionLogger to check pause state
         """
         self.admin_url = normalize_wp_admin_root(admin_url)
         self.username = username
         self.password = password
         self.logger = PlaywrightLogger()
+        self.pause_ctrl = pause_ctrl
+        self.execution_logger = execution_logger
         
         # Parse base URL from admin_url
         parsed = urlparse(self.admin_url)
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
     
+    async def _login_attempt(self, page: Page) -> bool:
+        """Single login attempt (no retries)."""
+        if self.pause_ctrl is not None:
+            await self.pause_ctrl.wait_if_paused()
+
+        await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
+
+        try:
+            await page.wait_for_url("**/wp-admin/", timeout=2000)
+            self.logger.add_log("✅ Already logged in", "success", "")
+            return True
+        except Exception:
+            pass
+
+        username_field = await page.query_selector('input[name="log"]') or await page.query_selector(
+            'input[type="text"]'
+        )
+        password_field = await page.query_selector('input[name="pwd"]') or await page.query_selector(
+            'input[type="password"]'
+        )
+
+        if not username_field or not password_field:
+            self.logger.add_log("❌ Login form not found", "error", "")
+            return False
+
+        if self.pause_ctrl is not None:
+            await self.pause_ctrl.wait_if_paused()
+
+        await username_field.fill(self.username)
+        await password_field.fill(self.password)
+
+        login_button = await page.query_selector('button[type="submit"], input[type="submit"]')
+        if login_button:
+            await login_button.click()
+        else:
+            await page.press('input[type="password"]', 'Enter')
+
+        await page.wait_for_url("**/wp-admin/", timeout=12000)
+        self.logger.add_log("✅ Login successful", "success", "")
+        return True
+
     async def login(self, page: Page) -> bool:
         """
-        Log into WordPress admin panel with optimized performance.
-        Skips screenshots and reduces waits.
-        
-        Returns:
-            True if login successful, False otherwise
+        Log into WordPress admin panel with retries (helps parallel Playwright workers).
         """
+        raw_retries = os.getenv("PLAYWRIGHT_LOGIN_RETRIES", "3")
         try:
-            self.logger.add_log("🔐 WordPress Login", "info", "")
-            
-            await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
-            
+            max_attempts = max(1, int(raw_retries))
+        except Exception:
+            max_attempts = 3
+
+        self.logger.add_log("🔐 WordPress Login", "info", "")
+
+        last_err: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
             try:
-                await page.wait_for_url("**/wp-admin/", timeout=2000)
-                self.logger.add_log("✅ Already logged in", "success", "")
-                return True
-            except Exception:
-                pass
-            
-            username_field = await page.query_selector('input[name="log"]') or await page.query_selector('input[type="text"]')
-            password_field = await page.query_selector('input[name="pwd"]') or await page.query_selector('input[type="password"]')
-            
-            if not username_field or not password_field:
-                self.logger.add_log("❌ Login form not found", "error", "")
-                return False
-            
-            await username_field.fill(self.username)
-            await password_field.fill(self.password)
-            
-            login_button = await page.query_selector('button[type="submit"], input[type="submit"]')
-            if login_button:
-                await login_button.click()
-            else:
-                await page.press('input[type="password"]', 'Enter')
-            
-            await page.wait_for_url("**/wp-admin/", timeout=12000)
-            self.logger.add_log("✅ Login successful", "success", "")
-            return True
-            
-        except Exception as e:
-            self.logger.add_log("❌ Login failed", "error", str(e)[:60])
-            logger.error(f"WordPress login failed: {e}")
-            return False
+                if await self._login_attempt(page):
+                    return True
+            except Exception as e:
+                last_err = e
+                self.logger.add_log(
+                    f"❌ Login attempt {attempt}/{max_attempts} failed",
+                    "error",
+                    str(e)[:60],
+                )
+                logger.warning("WordPress login attempt %s failed: %s", attempt, e)
+            if attempt < max_attempts:
+                await asyncio.sleep(0.75 * attempt)
+
+        if last_err is not None:
+            self.logger.add_log("❌ Login failed", "error", str(last_err)[:60])
+            logger.error(f"WordPress login failed after {max_attempts} attempts: {last_err}")
+        else:
+            self.logger.add_log("❌ Login failed", "error", "Could not reach wp-admin")
+        return False
     
     async def _close_popup_if_exists(self, page: Page) -> None:
         """
@@ -1433,6 +1481,9 @@ class WordPressPlaywright:
     ) -> dict[str, Any]:
         """Update SEO meta description with light mode enabled for speed."""
         try:
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+            
             page_slug, prep_err = await self._prepare_seo_post_editor(
                 page,
                 page_url,
@@ -1447,12 +1498,20 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
+            # Pause checkpoint before filling field
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+
             filled = await self._fill_seo_meta_description(page, meta_description)
             if not filled:
                 filled = await self._fill_seo_meta_description_fallback(page, meta_description)
             
             if not filled:
                 return {"status": "failed", "error": "Meta description field not found"}
+
+            # Pause checkpoint before saving
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
@@ -1484,6 +1543,9 @@ class WordPressPlaywright:
     ) -> dict[str, Any]:
         """Update SEO title with light mode enabled for speed."""
         try:
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+            
             page_slug, prep_err = await self._prepare_seo_post_editor(
                 page,
                 page_url,
@@ -1498,11 +1560,19 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
+            # Pause checkpoint before filling field
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+
             filled = await self._fill_seo_meta_title(page, meta_title)
             if not filled:
                 filled = await self._fill_seo_meta_title_fallback(page, meta_title)
             if not filled:
                 return {"status": "failed", "error": "SEO title field not found"}
+
+            # Pause checkpoint before saving
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
