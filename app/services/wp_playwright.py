@@ -14,6 +14,7 @@ Pause/Resume Integration Notes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -369,57 +370,81 @@ class WordPressPlaywright:
         parsed = urlparse(self.admin_url)
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
     
+    async def _login_attempt(self, page: Page) -> bool:
+        """Single login attempt (no retries)."""
+        if self.pause_ctrl is not None:
+            await self.pause_ctrl.wait_if_paused()
+
+        await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
+
+        try:
+            await page.wait_for_url("**/wp-admin/", timeout=2000)
+            self.logger.add_log("✅ Already logged in", "success", "")
+            return True
+        except Exception:
+            pass
+
+        username_field = await page.query_selector('input[name="log"]') or await page.query_selector(
+            'input[type="text"]'
+        )
+        password_field = await page.query_selector('input[name="pwd"]') or await page.query_selector(
+            'input[type="password"]'
+        )
+
+        if not username_field or not password_field:
+            self.logger.add_log("❌ Login form not found", "error", "")
+            return False
+
+        if self.pause_ctrl is not None:
+            await self.pause_ctrl.wait_if_paused()
+
+        await username_field.fill(self.username)
+        await password_field.fill(self.password)
+
+        login_button = await page.query_selector('button[type="submit"], input[type="submit"]')
+        if login_button:
+            await login_button.click()
+        else:
+            await page.press('input[type="password"]', 'Enter')
+
+        await page.wait_for_url("**/wp-admin/", timeout=12000)
+        self.logger.add_log("✅ Login successful", "success", "")
+        return True
+
     async def login(self, page: Page) -> bool:
         """
-        Log into WordPress admin panel with optimized performance.
-        Skips screenshots and reduces waits.
-        
-        Returns:
-            True if login successful, False otherwise
+        Log into WordPress admin panel with retries (helps parallel Playwright workers).
         """
+        raw_retries = os.getenv("PLAYWRIGHT_LOGIN_RETRIES", "3")
         try:
-            if self.pause_ctrl is not None:
-                await self.pause_ctrl.wait_if_paused()
-            
-            self.logger.add_log("🔐 WordPress Login", "info", "")
-            
-            await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
-            
+            max_attempts = max(1, int(raw_retries))
+        except Exception:
+            max_attempts = 3
+
+        self.logger.add_log("🔐 WordPress Login", "info", "")
+
+        last_err: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
             try:
-                await page.wait_for_url("**/wp-admin/", timeout=2000)
-                self.logger.add_log("✅ Already logged in", "success", "")
-                return True
-            except Exception:
-                pass
-            
-            username_field = await page.query_selector('input[name="log"]') or await page.query_selector('input[type="text"]')
-            password_field = await page.query_selector('input[name="pwd"]') or await page.query_selector('input[type="password"]')
-            
-            if not username_field or not password_field:
-                self.logger.add_log("❌ Login form not found", "error", "")
-                return False
-            
-            # Pause checkpoint before filling credentials
-            if self.pause_ctrl is not None:
-                await self.pause_ctrl.wait_if_paused()
-            
-            await username_field.fill(self.username)
-            await password_field.fill(self.password)
-            
-            login_button = await page.query_selector('button[type="submit"], input[type="submit"]')
-            if login_button:
-                await login_button.click()
-            else:
-                await page.press('input[type="password"]', 'Enter')
-            
-            await page.wait_for_url("**/wp-admin/", timeout=12000)
-            self.logger.add_log("✅ Login successful", "success", "")
-            return True
-            
-        except Exception as e:
-            self.logger.add_log("❌ Login failed", "error", str(e)[:60])
-            logger.error(f"WordPress login failed: {e}")
-            return False
+                if await self._login_attempt(page):
+                    return True
+            except Exception as e:
+                last_err = e
+                self.logger.add_log(
+                    f"❌ Login attempt {attempt}/{max_attempts} failed",
+                    "error",
+                    str(e)[:60],
+                )
+                logger.warning("WordPress login attempt %s failed: %s", attempt, e)
+            if attempt < max_attempts:
+                await asyncio.sleep(0.75 * attempt)
+
+        if last_err is not None:
+            self.logger.add_log("❌ Login failed", "error", str(last_err)[:60])
+            logger.error(f"WordPress login failed after {max_attempts} attempts: {last_err}")
+        else:
+            self.logger.add_log("❌ Login failed", "error", "Could not reach wp-admin")
+        return False
     
     async def _close_popup_if_exists(self, page: Page) -> None:
         """

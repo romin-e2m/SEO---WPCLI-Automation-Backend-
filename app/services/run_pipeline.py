@@ -48,6 +48,48 @@ def _max_run_rows() -> int:
         return 500
 
 
+def _seo_playwright_worker_count() -> int:
+    """Parallel Playwright browsers for meta / meta_title (value from PLAYWRIGHT_SEO_WORKERS)."""
+    raw = os.getenv("PLAYWRIGHT_SEO_WORKERS", "6")
+    try:
+        n = int(raw)
+    except Exception:
+        n = 6
+    return max(1, n)
+
+
+def _seo_playwright_min_rows_per_worker() -> int:
+    """Avoid too many browsers for few rows (each browser still needs its own login)."""
+    raw = os.getenv("PLAYWRIGHT_SEO_MIN_ROWS_PER_WORKER", "3")
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 3
+
+
+def _seo_playwright_login_gap_sec() -> float:
+    """Optional spacing between login lock handoffs (seconds). Default 0."""
+    raw = os.getenv("PLAYWRIGHT_SEO_LOGIN_GAP_SEC", "0")
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return 0.0
+
+
+def _effective_seo_worker_count(playwright_job_count: int) -> int:
+    """
+    Honor PLAYWRIGHT_SEO_WORKERS but cap workers when rows are few.
+    Example: 6 jobs, min 3 rows/worker -> at most 2 workers even if env says 5.
+    """
+    configured = _seo_playwright_worker_count()
+    jobs = max(0, playwright_job_count)
+    if jobs == 0:
+        return 1
+    min_rows = _seo_playwright_min_rows_per_worker()
+    max_useful = max(1, jobs // min_rows)
+    return min(configured, jobs, max_useful)
+
+
 def _s(v: Any) -> str:
     if v is None:
         return ""
@@ -951,6 +993,7 @@ async def _exec_seo_playwright_batch_run(
     spec: _SeoPlaywrightSpec,
     pause_ctrl: "Any | None" = None,
     execution_logger: "ExecutionLogger | None" = None,
+    login_lock: asyncio.Lock | None = None,
 ) -> list[ExecuteRowResult]:
     """One browser session: login once, then run each job ``(row, post_id, page_url, new_value, old_value)``.
     
@@ -988,7 +1031,17 @@ async def _exec_seo_playwright_batch_run(
         if pause_ctrl is not None:
             await pause_ctrl.wait_if_paused()
 
-        if not await wp.login(page):
+        logged_in = False
+        if login_lock is not None:
+            async with login_lock:
+                logged_in = await wp.login(page)
+                gap = _seo_playwright_login_gap_sec()
+                if gap > 0:
+                    await asyncio.sleep(gap)
+        else:
+            logged_in = await wp.login(page)
+
+        if not logged_in:
             await context.close()
             await browser.close()
             fail_logs = wp.logger.get_logs()
@@ -1068,19 +1121,445 @@ async def _exec_seo_playwright_batch_run(
         return out
 
 
-def _exec_seo_consecutive_playwright_batch(
+_SeoPwJob = tuple[int, NormalizedRow, int, str, str, str | None]
+_CombinedSeoWork = tuple[int, str, _SeoPwJob | None, _SeoPwJob | None]
+
+
+def _build_combined_seo_works(
+    meta_jobs: list[_SeoPwJob], title_jobs: list[_SeoPwJob]
+) -> list[_CombinedSeoWork]:
+    """One work unit per post_id (meta and/or title in a single browser session)."""
+    by_pid: dict[int, dict[str, Any]] = {}
+    for job in meta_jobs:
+        pid = job[2]
+        by_pid[pid] = {"page_url": job[3], "meta": job}
+    for job in title_jobs:
+        pid = job[2]
+        entry = by_pid.setdefault(pid, {"page_url": job[3]})
+        entry["page_url"] = entry.get("page_url") or job[3]
+        entry["title"] = job
+    works: list[_CombinedSeoWork] = []
+    for pid, entry in by_pid.items():
+        works.append(
+            (
+                pid,
+                entry.get("page_url") or "",
+                entry.get("meta"),
+                entry.get("title"),
+            )
+        )
+    return works
+
+
+async def _exec_seo_playwright_combined_batch_run(
     site: SiteAccess,
-    batch: list[NormalizedRow],
+    works: list[_CombinedSeoWork],
+    pause_ctrl: "Any | None",
+    execution_logger: "ExecutionLogger | None",
+    login_lock: asyncio.Lock | None,
+) -> list[tuple[str, int, ExecuteRowResult]]:
+    """Login once; for each post update meta description and/or SEO title."""
+    if not site.playwright or not works:
+        return []
+
+    from playwright.async_api import async_playwright
+
+    updates: list[tuple[str, int, ExecuteRowResult]] = []
+
+    async with async_playwright() as p:
+        browser = await launch_chromium(p, headless=should_run_headless())
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 1024},
+            ignore_https_errors=True,
+        )
+        page = await context.new_page()
+        page.set_default_timeout(45000)
+        page.set_default_navigation_timeout(45000)
+
+        wp = WordPressPlaywright(
+            site.playwright.admin_url,
+            site.playwright.username,
+            site.playwright.password.get_secret_value(),
+            pause_ctrl=pause_ctrl,
+            execution_logger=execution_logger,
+        )
+
+        if pause_ctrl is not None:
+            await pause_ctrl.wait_if_paused()
+
+        logged_in = False
+        if login_lock is not None:
+            async with login_lock:
+                logged_in = await wp.login(page)
+                gap = _seo_playwright_login_gap_sec()
+                if gap > 0:
+                    await asyncio.sleep(gap)
+        else:
+            logged_in = await wp.login(page)
+
+        if not logged_in:
+            fail_logs = wp.logger.get_logs()
+            for _pid, page_url, meta_job, title_job in works:
+                if meta_job:
+                    idx, row, pid, url, new_v, old_v = meta_job
+                    updates.append(
+                        (
+                            "meta",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="failed",
+                                message="Failed to log in to WordPress admin panel",
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META, url, old_v, new_v, playwright_logs=fail_logs
+                                ),
+                            ),
+                        )
+                    )
+                if title_job:
+                    idx, row, pid, url, new_v, old_v = title_job
+                    updates.append(
+                        (
+                            "meta_title",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta_title",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="failed",
+                                message="Failed to log in to WordPress admin panel",
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META_TITLE,
+                                    url,
+                                    old_v,
+                                    new_v,
+                                    playwright_logs=fail_logs,
+                                ),
+                            ),
+                        )
+                    )
+            await context.close()
+            await browser.close()
+            return updates
+
+        for _pid, page_url, meta_job, title_job in works:
+            if execution_logger is not None and execution_logger.is_paused():
+                break
+            if pause_ctrl is not None:
+                await pause_ctrl.wait_if_paused()
+
+            if meta_job:
+                idx, row, pid, url, new_v, old_v = meta_job
+                wp.logger.clear_logs()
+                result = await wp.update_meta_description(
+                    url, new_v, page, post_id=pid, light_mode=True
+                )
+                logs = wp.logger.get_logs()
+                if result.get("status") == "updated":
+                    updates.append(
+                        (
+                            "meta",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="updated",
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META,
+                                    url,
+                                    old_v,
+                                    new_v,
+                                    playwright_logs=logs,
+                                    raw_id=pid,
+                                ),
+                            ),
+                        )
+                    )
+                else:
+                    updates.append(
+                        (
+                            "meta",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="failed",
+                                message=result.get("error", "Unknown error"),
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META, url, old_v, new_v, playwright_logs=logs
+                                ),
+                            ),
+                        )
+                    )
+                if result.get("status") == "paused":
+                    break
+
+            if title_job:
+                idx, row, pid, url, new_v, old_v = title_job
+                wp.logger.clear_logs()
+                result = await wp.update_meta_title(
+                    url, new_v, page, post_id=pid, light_mode=True
+                )
+                logs = wp.logger.get_logs()
+                if result.get("status") == "updated":
+                    updates.append(
+                        (
+                            "meta_title",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta_title",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="updated",
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META_TITLE,
+                                    url,
+                                    old_v,
+                                    new_v,
+                                    playwright_logs=logs,
+                                    raw_id=pid,
+                                ),
+                            ),
+                        )
+                    )
+                else:
+                    updates.append(
+                        (
+                            "meta_title",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta_title",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="failed",
+                                message=result.get("error", "Unknown error"),
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META_TITLE,
+                                    url,
+                                    old_v,
+                                    new_v,
+                                    playwright_logs=logs,
+                                ),
+                            ),
+                        )
+                    )
+                if result.get("status") == "paused":
+                    break
+
+        await context.close()
+        await browser.close()
+
+    return updates
+
+
+async def _seo_playwright_combined_chunk_async(
+    site: SiteAccess,
+    chunk: list[_CombinedSeoWork],
+    pause_ctrl: "Any | None",
+    execution_logger: "ExecutionLogger | None",
+    login_lock: asyncio.Lock | None,
+) -> list[tuple[str, int, ExecuteRowResult]]:
+    try:
+        return await _exec_seo_playwright_combined_batch_run(
+            site, chunk, pause_ctrl, execution_logger, login_lock
+        )
+    except Exception as e:
+        logger.error("Combined Playwright worker failed: %s: %s", type(e).__name__, e)
+        out: list[tuple[str, int, ExecuteRowResult]] = []
+        for _pid, _url, meta_job, title_job in chunk:
+            if meta_job:
+                idx, row, pid, url, new_v, old_v = meta_job
+                out.append(
+                    (
+                        "meta",
+                        idx,
+                        ExecuteRowResult(
+                            action_type="meta",
+                            sheet_name=row.sheet_name,
+                            row_index=row.row_index,
+                            outcome="failed",
+                            message=f"Playwright worker error: {e}",
+                            post_id=pid,
+                            detail=_seo_pw_job_detail(_SEO_PW_META, url, old_v, new_v),
+                        ),
+                    )
+                )
+            if title_job:
+                idx, row, pid, url, new_v, old_v = title_job
+                out.append(
+                    (
+                        "meta_title",
+                        idx,
+                        ExecuteRowResult(
+                            action_type="meta_title",
+                            sheet_name=row.sheet_name,
+                            row_index=row.row_index,
+                            outcome="failed",
+                            message=f"Playwright worker error: {e}",
+                            post_id=pid,
+                            detail=_seo_pw_job_detail(_SEO_PW_META_TITLE, url, old_v, new_v),
+                        ),
+                    )
+                )
+        return out
+
+
+async def _seo_playwright_combined_pool_gather_async(
+    site: SiteAccess,
+    buckets: list[list[_CombinedSeoWork]],
+    pause_ctrl: "Any | None",
+    execution_logger: "ExecutionLogger | None",
+) -> list[tuple[str, int, ExecuteRowResult]]:
+    login_lock = asyncio.Lock() if len(buckets) > 1 else None
+    outcomes = await asyncio.gather(
+        *[
+            _seo_playwright_combined_chunk_async(
+                site, bucket, pause_ctrl, execution_logger, login_lock
+            )
+            for bucket in buckets
+        ],
+        return_exceptions=True,
+    )
+    merged: list[tuple[str, int, ExecuteRowResult]] = []
+    for bucket, outcome in zip(buckets, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error("Combined pool worker failed: %s", outcome)
+            for _pid, _url, meta_job, title_job in bucket:
+                if meta_job:
+                    idx, row, pid, url, new_v, old_v = meta_job
+                    merged.append(
+                        (
+                            "meta",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="failed",
+                                message=f"Playwright pool error: {outcome}",
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(_SEO_PW_META, url, old_v, new_v),
+                            ),
+                        )
+                    )
+                if title_job:
+                    idx, row, pid, url, new_v, old_v = title_job
+                    merged.append(
+                        (
+                            "meta_title",
+                            idx,
+                            ExecuteRowResult(
+                                action_type="meta_title",
+                                sheet_name=row.sheet_name,
+                                row_index=row.row_index,
+                                outcome="failed",
+                                message=f"Playwright pool error: {outcome}",
+                                post_id=pid,
+                                detail=_seo_pw_job_detail(
+                                    _SEO_PW_META_TITLE, url, old_v, new_v
+                                ),
+                            ),
+                        )
+                    )
+        else:
+            merged.extend(outcome)
+    return merged
+
+
+def _partition_combined_works(
+    works: list[_CombinedSeoWork], worker_count: int
+) -> list[list[_CombinedSeoWork]]:
+    buckets: list[list[_CombinedSeoWork]] = [[] for _ in range(worker_count)]
+    for n, work in enumerate(works):
+        buckets[n % worker_count].append(work)
+    return [b for b in buckets if b]
+
+
+def _exec_seo_combined_playwright_batch(
+    site: SiteAccess,
+    meta_rows: list[NormalizedRow],
+    title_rows: list[NormalizedRow],
     seo_plugin: str | None,
-    spec: _SeoPlaywrightSpec,
     execution_logger: "ExecutionLogger | None" = None,
 ) -> list[ExecuteRowResult]:
-    """Dry-run each row; run one Playwright session for all rows that need a change."""
+    """Meta + meta_title in one Playwright pass per worker (one login per worker)."""
+    if execution_logger is not None and execution_logger.is_paused():
+        return []
+
+    res_m, jobs_m = _seo_playwright_prepare_batch(
+        site, meta_rows, _SEO_PW_META, execution_logger
+    )
+    res_t, jobs_t = _seo_playwright_prepare_batch(
+        site, title_rows, _SEO_PW_META_TITLE, execution_logger
+    )
+    works = _build_combined_seo_works(jobs_m, jobs_t)
+
+    if not works:
+        return [r for r in res_m if r is not None] + [r for r in res_t if r is not None]
+
+    configured = _seo_playwright_worker_count()
+    row_units = max(len(works), len(jobs_m) + len(jobs_t), len(meta_rows) + len(title_rows))
+    worker_count = _effective_seo_worker_count(row_units)
+    if execution_logger is not None:
+        execution_logger.log_sync(
+            "meta_playwright_combined_pool",
+            "pending",
+            f"{len(works)} post(s), {len(jobs_m) + len(jobs_t)} Playwright job(s), "
+            f"{worker_count} worker(s) (PLAYWRIGHT_SEO_WORKERS={configured}, "
+            f"min {_seo_playwright_min_rows_per_worker()} rows/worker)",
+        )
+
+    pause_ctrl = _seo_playwright_pool_pause_ctrl(execution_logger)
+
+    if worker_count <= 1:
+        updates = _run_seo_playwright_pool_coroutine(
+            _seo_playwright_combined_chunk_async(
+                site, works, pause_ctrl, execution_logger, None
+            )
+        )
+    else:
+        buckets = _partition_combined_works(works, worker_count)
+        updates = _run_seo_playwright_pool_coroutine(
+            _seo_playwright_combined_pool_gather_async(
+                site, buckets, pause_ctrl, execution_logger
+            )
+        )
+
+    for kind, idx, er in updates:
+        if kind == "meta":
+            res_m[idx] = er
+        else:
+            res_t[idx] = er
+
+    return [r for r in res_m if r is not None] + [r for r in res_t if r is not None]
+
+
+def _seo_playwright_prepare_batch(
+    site: SiteAccess,
+    batch: list[NormalizedRow],
+    spec: _SeoPlaywrightSpec,
+    execution_logger: "ExecutionLogger | None",
+) -> tuple[list[ExecuteRowResult | None], list[_SeoPwJob]]:
+    """Dry-run rows; return per-row results (or None) and Playwright jobs (unique post_id)."""
     n = len(batch)
     results: list[ExecuteRowResult | None] = [None] * n
-    jobs: list[tuple[int, NormalizedRow, int, str, str, str | None]] = []
+    jobs: list[_SeoPwJob] = []
+    seen_post_ids: set[int] = set()
 
     for i, row in enumerate(batch):
+        if execution_logger is not None and execution_logger.is_paused():
+            break
+
         dr = spec.dry_fn(site, row)
         v = row.values
         page_url = _s(v.get("page_url"))
@@ -1101,8 +1580,6 @@ def _exec_seo_consecutive_playwright_batch(
                 post_id=dr.post_id,
                 detail=_seo_pw_job_detail(spec, page_url, old_val, rec),
             )
-            if execution_logger is not None and execution_logger.is_paused():
-                break
             continue
 
         pid = dr.post_id
@@ -1115,42 +1592,281 @@ def _exec_seo_consecutive_playwright_batch(
                 message="Missing post id.",
                 detail=_seo_pw_job_detail(spec, page_url, old_val, rec),
             )
-            if execution_logger is not None and execution_logger.is_paused():
-                break
             continue
 
+        if pid in seen_post_ids:
+            results[i] = ExecuteRowResult(
+                action_type=spec.action_type,
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="failed",
+                message="Duplicate post id in this run; only one parallel worker may update a post.",
+                post_id=pid,
+                detail=_seo_pw_job_detail(spec, page_url, old_val, rec),
+            )
+            continue
+        seen_post_ids.add(pid)
         jobs.append((i, row, pid, page_url, rec, old_val))
 
-    if jobs:
-        ordered = [(row, pid, url, new_v, old_v) for (_i, row, pid, url, new_v, old_v) in jobs]
-        try:
-            # Get PauseController from execution logger if available
-            pause_ctrl = None
-            if execution_logger is not None and hasattr(execution_logger, '_pause_controller'):
-                pause_ctrl = execution_logger._pause_controller
-            
-            # Pass execution_logger directly so batch can check pause state during execution
-            pw_list = asyncio.run(_exec_seo_playwright_batch_run(
-                site, ordered, spec, pause_ctrl=pause_ctrl, execution_logger=execution_logger
-            ))
-        except RuntimeError as e:
-            if "asyncio.run() cannot be called from a running event loop" in str(e):
-                logger.warning(spec.asyncio_batch_fallback_log)
-                for idx, row, pid, url, new_v, old_v in jobs:
-                    results[idx] = spec.rest_fallback(
-                        site, row, pid, new_v, seo_plugin, url, old_v
-                    )
-                    if execution_logger is not None and execution_logger.is_paused():
-                        break
-            else:
-                raise
-        else:
-            for k, (idx, row, pid, url, new_v, old_v) in enumerate(jobs):
-                if k >= len(pw_list):
-                    break
-                results[idx] = pw_list[k]
+    return results, jobs
 
+
+def _chunk_results_from_pw_list(
+    chunk: list[_SeoPwJob],
+    spec: _SeoPlaywrightSpec,
+    pw_list: list[ExecuteRowResult] | None,
+    *,
+    error_message: str | None = None,
+) -> list[tuple[int, ExecuteRowResult]]:
+    if error_message is not None:
+        return [
+            (
+                idx,
+                ExecuteRowResult(
+                    action_type=spec.action_type,
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message=error_message,
+                    post_id=pid,
+                    detail=_seo_pw_job_detail(spec, url, old_v, new_v),
+                ),
+            )
+            for idx, row, pid, url, new_v, old_v in chunk
+        ]
+    out: list[tuple[int, ExecuteRowResult]] = []
+    pw_list = pw_list or []
+    for k, (idx, row, pid, url, new_v, old_v) in enumerate(chunk):
+        if k < len(pw_list):
+            out.append((idx, pw_list[k]))
+        else:
+            out.append(
+                (
+                    idx,
+                    ExecuteRowResult(
+                        action_type=spec.action_type,
+                        sheet_name=row.sheet_name,
+                        row_index=row.row_index,
+                        outcome="failed",
+                        message="Playwright worker stopped early (paused or error).",
+                        post_id=pid,
+                        detail=_seo_pw_job_detail(spec, url, old_v, new_v),
+                    ),
+                )
+            )
+    return out
+
+
+async def _seo_playwright_worker_run_chunk_async(
+    site: SiteAccess,
+    chunk: list[_SeoPwJob],
+    spec: _SeoPlaywrightSpec,
+    pause_ctrl: "Any | None",
+    execution_logger: "ExecutionLogger | None",
+    login_lock: asyncio.Lock | None = None,
+) -> list[tuple[int, ExecuteRowResult]]:
+    """One browser session per worker: login once, then each job in chunk (same event loop)."""
+    if not chunk:
+        return []
+    ordered = [(row, pid, url, new_v, old_v) for (_i, row, pid, url, new_v, old_v) in chunk]
+    try:
+        pw_list = await _exec_seo_playwright_batch_run(
+            site,
+            ordered,
+            spec,
+            pause_ctrl=pause_ctrl,
+            execution_logger=execution_logger,
+            login_lock=login_lock,
+        )
+    except Exception as e:
+        logger.error(
+            "Playwright worker failed for %s: %s: %s",
+            spec.action_type,
+            type(e).__name__,
+            e,
+        )
+        return _chunk_results_from_pw_list(
+            chunk, spec, None, error_message=f"Playwright worker error: {e}"
+        )
+    return _chunk_results_from_pw_list(chunk, spec, pw_list)
+
+
+async def _seo_playwright_pool_gather_async(
+    site: SiteAccess,
+    buckets: list[list[_SeoPwJob]],
+    spec: _SeoPlaywrightSpec,
+    pause_ctrl: "Any | None",
+    execution_logger: "ExecutionLogger | None",
+) -> list[tuple[int, ExecuteRowResult]]:
+    """Run all worker buckets on one asyncio loop (avoids uvloop subprocess races)."""
+    login_lock = asyncio.Lock() if len(buckets) > 1 else None
+    outcomes = await asyncio.gather(
+        *[
+            _seo_playwright_worker_run_chunk_async(
+                site, bucket, spec, pause_ctrl, execution_logger, login_lock
+            )
+            for bucket in buckets
+        ],
+        return_exceptions=True,
+    )
+    merged: list[tuple[int, ExecuteRowResult]] = []
+    for bucket, outcome in zip(buckets, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(
+                "Playwright pool worker failed for %s: %s: %s",
+                spec.action_type,
+                type(outcome).__name__,
+                outcome,
+            )
+            merged.extend(
+                _chunk_results_from_pw_list(
+                    bucket,
+                    spec,
+                    None,
+                    error_message=f"Playwright pool error: {outcome}",
+                )
+            )
+        else:
+            merged.extend(outcome)
+    return merged
+
+
+def _seo_playwright_pool_pause_ctrl(
+    execution_logger: "ExecutionLogger | None",
+) -> "Any | None":
+    if execution_logger is not None and hasattr(execution_logger, "_pause_controller"):
+        return execution_logger._pause_controller
+    return None
+
+
+def _run_seo_playwright_pool_coroutine(coro: Any) -> Any:
+    """Run pool on one loop per thread (never ThreadPoolExecutor + asyncio.run)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("asyncio.run() cannot be called from a running event loop")
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    if loop.is_running() or loop.is_closed():
+        return asyncio.run(coro)
+
+    return loop.run_until_complete(coro)
+
+
+def _partition_jobs_for_workers(
+    jobs: list[_SeoPwJob], worker_count: int
+) -> list[list[_SeoPwJob]]:
+    """Round-robin split so each worker gets a similar number of rows."""
+    buckets: list[list[_SeoPwJob]] = [[] for _ in range(worker_count)]
+    for n, job in enumerate(jobs):
+        buckets[n % worker_count].append(job)
+    return [b for b in buckets if b]
+
+
+def _exec_seo_playwright_worker_pool(
+    site: SiteAccess,
+    batch: list[NormalizedRow],
+    seo_plugin: str | None,
+    spec: _SeoPlaywrightSpec,
+    execution_logger: "ExecutionLogger | None" = None,
+) -> list[ExecuteRowResult]:
+    """Meta / meta_title only: dry-run, then up to N parallel Playwright browsers (login once per worker)."""
+    results, jobs = _seo_playwright_prepare_batch(site, batch, spec, execution_logger)
+
+    if not jobs:
+        return [r for r in results if r is not None]
+
+    configured = _seo_playwright_worker_count()
+    worker_count = _effective_seo_worker_count(len(jobs))
+    if execution_logger is not None:
+        execution_logger.log_sync(
+            f"{spec.action_type}_playwright_pool",
+            "pending",
+            f"{len(jobs)} Playwright job(s), {worker_count} worker(s) "
+            f"(PLAYWRIGHT_SEO_WORKERS={configured}, "
+            f"min {_seo_playwright_min_rows_per_worker()} rows/worker)",
+        )
+
+    pause_ctrl = _seo_playwright_pool_pause_ctrl(execution_logger)
+
+    if worker_count <= 1:
+        chunk_results = _run_seo_playwright_pool_coroutine(
+            _seo_playwright_worker_run_chunk_async(
+                site, jobs, spec, pause_ctrl, execution_logger
+            )
+        )
+        for idx, er in chunk_results:
+            results[idx] = er
+        return [r for r in results if r is not None]
+
+    buckets = _partition_jobs_for_workers(jobs, worker_count)
+    paused_during_pool = (
+        execution_logger is not None and execution_logger.is_paused()
+    )
+
+    merged = _run_seo_playwright_pool_coroutine(
+        _seo_playwright_pool_gather_async(
+            site, buckets, spec, pause_ctrl, execution_logger
+        )
+    )
+    if execution_logger is not None and execution_logger.is_paused():
+        paused_during_pool = True
+
+    for idx, er in merged:
+        results[idx] = er
+
+    if paused_during_pool:
+        for j in jobs:
+            idx = j[0]
+            if results[idx] is None:
+                _i, row, pid, url, new_v, old_v = j
+                results[idx] = ExecuteRowResult(
+                    action_type=spec.action_type,
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Not run: execution paused during parallel Playwright.",
+                    post_id=pid,
+                    detail=_seo_pw_job_detail(spec, url, old_v, new_v),
+                )
+
+    # REST fallback if asyncio unavailable in main thread only (workers use asyncio.run)
     return [r for r in results if r is not None]
+
+
+def _exec_seo_consecutive_playwright_batch(
+    site: SiteAccess,
+    batch: list[NormalizedRow],
+    seo_plugin: str | None,
+    spec: _SeoPlaywrightSpec,
+    execution_logger: "ExecutionLogger | None" = None,
+) -> list[ExecuteRowResult]:
+    """Dry-run each row; parallel Playwright workers (meta / meta_title)."""
+    if execution_logger is not None and execution_logger.is_paused():
+        return []
+
+    try:
+        return _exec_seo_playwright_worker_pool(
+            site, batch, seo_plugin, spec, execution_logger
+        )
+    except RuntimeError as e:
+        if "asyncio.run() cannot be called from a running event loop" not in str(e):
+            raise
+        logger.warning(spec.asyncio_batch_fallback_log)
+        results, jobs = _seo_playwright_prepare_batch(site, batch, spec, execution_logger)
+        for idx, row, pid, url, new_v, old_v in jobs:
+            results[idx] = spec.rest_fallback(
+                site, row, pid, new_v, seo_plugin, url, old_v
+            )
+            if execution_logger is not None and execution_logger.is_paused():
+                break
+        return [r for r in results if r is not None]
 
 
 async def _exec_seo_playwright(
@@ -2215,19 +2931,64 @@ def run_execute(
             while i < len(rows_iter):
                 action, row = rows_iter[i]
                 try:
-                    if action in ("meta", "meta_title") and site.playwright:
-                        # One Playwright session per flat row so pause/resume matches user expectation.
-                        spec = _SEO_PW_META if action == "meta" else _SEO_PW_META_TITLE
-                        batch_results = list(
-                            _exec_seo_consecutive_playwright_batch(
-                                site, [row], seo_plugin, spec, execution_logger
+                    pw_batch_results: list[ExecuteRowResult] | None = None
+                    pw_next_i: int | None = None
+                    pw_pause_label = action
+
+                    if action == "meta" and site.playwright:
+                        block_meta: list[NormalizedRow] = []
+                        j = i
+                        while j < len(rows_iter) and rows_iter[j][0] == "meta":
+                            block_meta.append(rows_iter[j][1])
+                            j += 1
+                        block_title: list[NormalizedRow] = []
+                        if j < len(rows_iter) and rows_iter[j][0] == "meta_title":
+                            while j < len(rows_iter) and rows_iter[j][0] == "meta_title":
+                                block_title.append(rows_iter[j][1])
+                                j += 1
+                        if block_title:
+                            pw_batch_results = _exec_seo_combined_playwright_batch(
+                                site,
+                                block_meta,
+                                block_title,
+                                seo_plugin,
+                                execution_logger,
                             )
+                            pw_pause_label = "meta+meta_title"
+                        else:
+                            pw_batch_results = _exec_seo_consecutive_playwright_batch(
+                                site,
+                                block_meta,
+                                seo_plugin,
+                                _SEO_PW_META,
+                                execution_logger,
+                            )
+                        pw_next_i = j
+                    elif action == "meta_title" and site.playwright:
+                        block_rows: list[NormalizedRow] = []
+                        j = i
+                        while j < len(rows_iter) and rows_iter[j][0] == "meta_title":
+                            block_rows.append(rows_iter[j][1])
+                            j += 1
+                        pw_batch_results = _exec_seo_consecutive_playwright_batch(
+                            site,
+                            block_rows,
+                            seo_plugin,
+                            _SEO_PW_META_TITLE,
+                            execution_logger,
                         )
-                        if not batch_results and execution_logger is not None and execution_logger.is_paused():
+                        pw_next_i = j
+
+                    if pw_batch_results is not None and pw_next_i is not None:
+                        if (
+                            not pw_batch_results
+                            and execution_logger is not None
+                            and execution_logger.is_paused()
+                        ):
                             execution_logger.log_sync(
                                 "execute_paused",
                                 "warning",
-                                f"Paused before completing row {i + 1} of {len(rows_iter)}",
+                                f"Paused during {pw_pause_label} Playwright block at row {i + 1}",
                             )
                             execution_logger.mark_complete()
                             return ExecuteResponse(
@@ -2239,7 +3000,7 @@ def run_execute(
                                 paused=True,
                                 rows_completed=i,
                             )
-                        for er in batch_results:
+                        for er in pw_batch_results:
                             rows_out.append(er)
                             emit_monitor_row_exec(
                                 er.action_type,
@@ -2249,7 +3010,7 @@ def run_execute(
                                 er.message,
                             )
                             _log_row(er)
-                        i += 1
+                        i = pw_next_i
                         if execution_logger is not None:
                             execution_logger.set_rows_completed(i)
                             if execution_logger.is_paused():
