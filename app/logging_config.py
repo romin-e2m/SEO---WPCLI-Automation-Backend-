@@ -47,12 +47,12 @@ LOGGING_CONFIG: dict[str, Any] = {
 
 
 class HealthCheckFilter(logging.Filter):
-    """Filter out health check and status endpoint logs."""
+    """Filter out health check access logs."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        # Suppress logs for health check and status endpoints
+        # Suppress logs for health check endpoint
         if hasattr(record, "getMessage"):
             message = record.getMessage()
-            if "/system/status" in message or "/health" in message:
+            if "/health" in message:
                 return False
         return True

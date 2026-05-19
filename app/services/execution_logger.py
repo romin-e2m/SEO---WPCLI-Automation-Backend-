@@ -1,6 +1,6 @@
 import threading
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import dataclass, asdict
 
 
@@ -28,6 +28,13 @@ class ExecutionLogger:
         self.logs: list[ExecutionLogEntry] = []
         self._log_counter = 0
         self._complete = False
+        self._paused = False
+        # Stored on execution start so resume can replay without the client re-sending the payload.
+        self._payload: Optional[dict[str, Any]] = None
+        # Index of the last fully-completed row (0-based into the flat rows_iter list).
+        self._rows_completed: int = 0
+        # Structured per-row results for live table rendering on the frontend.
+        self._row_results: list[dict[str, Any]] = []
 
     def is_complete(self) -> bool:
         with self._lock:
@@ -36,6 +43,41 @@ class ExecutionLogger:
     def mark_complete(self) -> None:
         with self._lock:
             self._complete = True
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def pause(self) -> None:
+        with self._lock:
+            if not self._complete:
+                self._paused = True
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = False
+
+    def resume_and_reset_complete(self) -> None:
+        """Atomically clear both the paused and complete flags for resume."""
+        with self._lock:
+            self._paused = False
+            self._complete = False
+
+    def set_rows_completed(self, n: int) -> None:
+        with self._lock:
+            self._rows_completed = n
+
+    def get_rows_completed(self) -> int:
+        with self._lock:
+            return self._rows_completed
+
+    def store_payload(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._payload = payload
+
+    def get_payload(self) -> Optional[dict[str, Any]]:
+        with self._lock:
+            return self._payload
 
     def log_sync(
         self,
@@ -72,12 +114,25 @@ class ExecutionLogger:
             )
             self.logs.append(entry)
 
+    def append_row_result(self, result_dict: dict) -> None:
+        """Append a structured per-row result dict for SSE streaming to the frontend."""
+        with self._lock:
+            self._row_results.append(result_dict)
+
+    def get_row_results(self) -> list[dict]:
+        """Return all row results accumulated so far."""
+        with self._lock:
+            return list(self._row_results)
+
     def clear(self) -> None:
         """Reset logs (e.g. before a new dry-run or execute)."""
         with self._lock:
             self.logs = []
             self._log_counter = 0
             self._complete = False
+            self._paused = False
+            self._rows_completed = 0
+            self._row_results = []
 
     def get_logs(self) -> list[dict]:
         """Get all logs so far."""
@@ -100,6 +155,8 @@ class ExecutionLogger:
                 "status_counts": status_counts,
                 "execution_id": self.execution_id,
                 "complete": self._complete,
+                "paused": self._paused,
+                "rows_completed": self._rows_completed,
                 "first_log": self.logs[0].timestamp if self.logs else None,
                 "last_log": self.logs[-1].timestamp if self.logs else None,
             }

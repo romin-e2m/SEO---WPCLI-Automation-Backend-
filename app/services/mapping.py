@@ -434,6 +434,7 @@ def normalize_mapping(
                     sheet_name=m.sheet_name,
                     row_index=idx,
                     values=mapped,
+                    original_values=dict(raw),
                 )
             )
 
