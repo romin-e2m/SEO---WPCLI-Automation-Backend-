@@ -70,6 +70,14 @@ def _normalize_for_comparison(s: str) -> str:
     return s.strip()
 
 
+def _sheet_value_missing_for_compare(value: str) -> bool:
+    """True when workbook 'current' is empty or a placeholder, not a real WP snapshot."""
+    t = _s(value).upper()
+    if not t:
+        return True
+    return t in ("MISSING", "N/A", "NA", "-", "—", "NONE", "NULL")
+
+
 # Empty old_* strings are meaningful for execute UI (e.g. missing H1 vs blank meta).
 _DETAIL_PRESERVE_EMPTY_KEYS = frozenset(
     {"old_title", "old_meta_title", "old_meta_description", "old_alt_text"}
@@ -431,17 +439,18 @@ def _dry_meta(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         if isinstance(yoast_head_json, dict):
             wp_cur_meta = _s(yoast_head_json.get("description", ""))
 
-    # Second check: verify Excel current matches WordPress current
-    if current_meta_from_sheet and wp_cur_meta and _normalize_for_comparison(current_meta_from_sheet) != _normalize_for_comparison(wp_cur_meta):
-        return DryRunRowResult(
-            action_type="meta",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message=f"Current meta description in sheet doesn't match WordPress: sheet='{current_meta_from_sheet}' vs wp='{wp_cur_meta}'",
-            post_id=pid,
-            resolution_method=res.method,
-        )
+    # Second check: verify sheet current matches WordPress (skip when sheet has no real current)
+    if not _sheet_value_missing_for_compare(current_meta_from_sheet):
+        if wp_cur_meta and _normalize_for_comparison(current_meta_from_sheet) != _normalize_for_comparison(wp_cur_meta):
+            return DryRunRowResult(
+                action_type="meta",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="blocked",
+                message=f"Current meta description in sheet doesn't match WordPress: sheet='{current_meta_from_sheet}' vs wp='{wp_cur_meta}'",
+                post_id=pid,
+                resolution_method=res.method,
+            )
 
     if _normalize_for_comparison(rec_meta) == _normalize_for_comparison(wp_cur_meta):
         return DryRunRowResult(
@@ -541,17 +550,17 @@ def _dry_meta_title(site: SiteAccess, row: NormalizedRow) -> DryRunRowResult:
         if isinstance(yoast_head_json, dict):
             wp_cur_title = _s(yoast_head_json.get("title", ""))
 
-    # Second check: verify Excel current matches WordPress current
-    if current_title_from_sheet and wp_cur_title and _normalize_for_comparison(current_title_from_sheet) != _normalize_for_comparison(wp_cur_title):
-        return DryRunRowResult(
-            action_type="meta_title",
-            sheet_name=row.sheet_name,
-            row_index=row.row_index,
-            outcome="blocked",
-            message=f"Current meta title in sheet doesn't match WordPress: sheet='{current_title_from_sheet}' vs wp='{wp_cur_title}'",
-            post_id=pid,
-            resolution_method=res.method,
-        )
+    if not _sheet_value_missing_for_compare(current_title_from_sheet):
+        if wp_cur_title and _normalize_for_comparison(current_title_from_sheet) != _normalize_for_comparison(wp_cur_title):
+            return DryRunRowResult(
+                action_type="meta_title",
+                sheet_name=row.sheet_name,
+                row_index=row.row_index,
+                outcome="blocked",
+                message=f"Current meta title in sheet doesn't match WordPress: sheet='{current_title_from_sheet}' vs wp='{wp_cur_title}'",
+                post_id=pid,
+                resolution_method=res.method,
+            )
 
     if _normalize_for_comparison(rec_title) == _normalize_for_comparison(wp_cur_title):
         return DryRunRowResult(
@@ -940,8 +949,18 @@ async def _exec_seo_playwright_batch_run(
     site: SiteAccess,
     jobs: list[tuple[NormalizedRow, int, str, str, str | None]],
     spec: _SeoPlaywrightSpec,
+    pause_ctrl: "Any | None" = None,
+    execution_logger: "ExecutionLogger | None" = None,
 ) -> list[ExecuteRowResult]:
-    """One browser session: login once, then run each job ``(row, post_id, page_url, new_value, old_value)``."""
+    """One browser session: login once, then run each job ``(row, post_id, page_url, new_value, old_value)``.
+    
+    Args:
+        site: WordPress site credentials
+        jobs: List of (row, post_id, page_url, new_value, old_value) tuples
+        spec: Playwright batch spec (meta/meta_title update configuration)
+        pause_ctrl: Optional PauseController for action-level pause checkpoints
+        execution_logger: Optional ExecutionLogger to check pause state during batch
+    """
     if not site.playwright:
         raise ValueError("Playwright credentials not provided")
 
@@ -961,7 +980,13 @@ async def _exec_seo_playwright_batch_run(
             site.playwright.admin_url,
             site.playwright.username,
             site.playwright.password.get_secret_value(),
+            pause_ctrl=pause_ctrl,
+            execution_logger=execution_logger,
         )
+
+        # Pause checkpoint: before login
+        if pause_ctrl is not None:
+            await pause_ctrl.wait_if_paused()
 
         if not await wp.login(page):
             await context.close()
@@ -985,6 +1010,15 @@ async def _exec_seo_playwright_batch_run(
         updater = getattr(wp, spec.wp_update_method)
         out: list[ExecuteRowResult] = []
         for row, pid, page_url, new_val, old_meta in jobs:
+            # CRITICAL: Check pause before processing each job
+            if execution_logger is not None and execution_logger.is_paused():
+                logger.info(f"Execution paused while processing {spec.action_type}")
+                break
+            
+            # Pause checkpoint: before each job/row
+            if pause_ctrl is not None:
+                await pause_ctrl.wait_if_paused()
+
             wp.logger.clear_logs()
             result = await updater(
                 page_url,
@@ -993,6 +1027,8 @@ async def _exec_seo_playwright_batch_run(
                 post_id=pid,
                 light_mode=True,
             )
+            if result.get("status") == "paused":
+                break
             logs = wp.logger.get_logs()
             if result.get("status") == "updated":
                 out.append(
@@ -1088,7 +1124,15 @@ def _exec_seo_consecutive_playwright_batch(
     if jobs:
         ordered = [(row, pid, url, new_v, old_v) for (_i, row, pid, url, new_v, old_v) in jobs]
         try:
-            pw_list = asyncio.run(_exec_seo_playwright_batch_run(site, ordered, spec))
+            # Get PauseController from execution logger if available
+            pause_ctrl = None
+            if execution_logger is not None and hasattr(execution_logger, '_pause_controller'):
+                pause_ctrl = execution_logger._pause_controller
+            
+            # Pass execution_logger directly so batch can check pause state during execution
+            pw_list = asyncio.run(_exec_seo_playwright_batch_run(
+                site, ordered, spec, pause_ctrl=pause_ctrl, execution_logger=execution_logger
+            ))
         except RuntimeError as e:
             if "asyncio.run() cannot be called from a running event loop" in str(e):
                 logger.warning(spec.asyncio_batch_fallback_log)
@@ -1102,9 +1146,9 @@ def _exec_seo_consecutive_playwright_batch(
                 raise
         else:
             for k, (idx, row, pid, url, new_v, old_v) in enumerate(jobs):
-                results[idx] = pw_list[k]
-                if execution_logger is not None and execution_logger.is_paused():
+                if k >= len(pw_list):
                     break
+                results[idx] = pw_list[k]
 
     return [r for r in results if r is not None]
 
@@ -1118,6 +1162,7 @@ async def _exec_seo_playwright(
     post_id: int,
     old_value: str | None,
     spec: _SeoPlaywrightSpec,
+    pause_ctrl: "Any | None" = None,
 ) -> ExecuteRowResult:
     """Execute meta description or SEO title update using Playwright."""
     if not site.playwright:
@@ -1147,6 +1192,7 @@ async def _exec_seo_playwright(
                 site.playwright.admin_url,
                 site.playwright.username,
                 site.playwright.password.get_secret_value(),
+                pause_ctrl=pause_ctrl,
             )
 
             if not await wp.login(page):
@@ -1211,7 +1257,7 @@ async def _exec_seo_playwright(
 
 
 async def _exec_redirects_301_playwright(
-    site: SiteAccess, from_url: str, to_url: str, row: NormalizedRow
+    site: SiteAccess, from_url: str, to_url: str, row: NormalizedRow, pause_ctrl: "Any | None" = None
 ) -> ExecuteRowResult:
     """Execute 301 redirect creation using Playwright."""
     if not site.playwright:
@@ -1234,6 +1280,7 @@ async def _exec_redirects_301_playwright(
                 site.playwright.admin_url,
                 site.playwright.username,
                 site.playwright.password.get_secret_value(),
+                pause_ctrl=pause_ctrl,
             )
 
             # Login
@@ -2169,14 +2216,30 @@ def run_execute(
                 action, row = rows_iter[i]
                 try:
                     if action in ("meta", "meta_title") and site.playwright:
+                        # One Playwright session per flat row so pause/resume matches user expectation.
                         spec = _SEO_PW_META if action == "meta" else _SEO_PW_META_TITLE
-                        batch_rows: list[NormalizedRow] = []
-                        while i < len(rows_iter) and rows_iter[i][0] == action:
-                            batch_rows.append(rows_iter[i][1])
-                            i += 1
-                        for er in _exec_seo_consecutive_playwright_batch(
-                            site, batch_rows, seo_plugin, spec, execution_logger
-                        ):
+                        batch_results = list(
+                            _exec_seo_consecutive_playwright_batch(
+                                site, [row], seo_plugin, spec, execution_logger
+                            )
+                        )
+                        if not batch_results and execution_logger is not None and execution_logger.is_paused():
+                            execution_logger.log_sync(
+                                "execute_paused",
+                                "warning",
+                                f"Paused before completing row {i + 1} of {len(rows_iter)}",
+                            )
+                            execution_logger.mark_complete()
+                            return ExecuteResponse(
+                                rows_processed=len(rows_out),
+                                updated=sum(1 for r in rows_out if r.outcome == "updated"),
+                                skipped=sum(1 for r in rows_out if r.outcome == "skipped"),
+                                failed=sum(1 for r in rows_out if r.outcome == "failed"),
+                                rows=rows_out,
+                                paused=True,
+                                rows_completed=i,
+                            )
+                        for er in batch_results:
                             rows_out.append(er)
                             emit_monitor_row_exec(
                                 er.action_type,
@@ -2186,14 +2249,14 @@ def run_execute(
                                 er.message,
                             )
                             _log_row(er)
+                        i += 1
                         if execution_logger is not None:
-                            rows_completed = len(rows_out)
-                            execution_logger.set_rows_completed(rows_completed)
+                            execution_logger.set_rows_completed(i)
                             if execution_logger.is_paused():
                                 execution_logger.log_sync(
                                     "execute_paused",
                                     "warning",
-                                    f"Paused after Playwright batch (completed {rows_completed} of {len(rows_iter)})",
+                                    f"Paused after row {i} of {len(rows_iter)}",
                                 )
                                 execution_logger.mark_complete()
                                 return ExecuteResponse(
@@ -2203,7 +2266,7 @@ def run_execute(
                                     failed=sum(1 for r in rows_out if r.outcome == "failed"),
                                     rows=rows_out,
                                     paused=True,
-                                    rows_completed=rows_completed,
+                                    rows_completed=i,
                                 )
                         continue
 

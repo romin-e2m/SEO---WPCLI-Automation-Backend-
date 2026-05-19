@@ -1,6 +1,15 @@
 """
 WordPress automation via Playwright for UI-based operations.
 Handles 301 redirects and meta descriptions through WordPress admin panel.
+
+Pause/Resume Integration Notes:
+- PauseController is passed through _exec_seo_playwright_batch_run
+- Use: await pause_ctrl.wait_if_paused() before major browser operations
+- Key checkpoint locations:
+  1. Before login (before page.goto)
+  2. Before navigating to edit page
+  3. Before filling form fields
+  4. Before saving/submitting
 """
 
 from __future__ import annotations
@@ -333,9 +342,12 @@ class WordPressPlaywright:
     """
     Automates WordPress admin panel operations using Playwright.
     Supports 301 redirects and meta description updates.
+    
+    Optional pause_controller for fine-grained pause/resume at action level.
+    Pass pause_ctrl to enable pause checks before major operations.
     """
     
-    def __init__(self, admin_url: str, username: str, password: str):
+    def __init__(self, admin_url: str, username: str, password: str, pause_ctrl: Any = None, execution_logger: Any = None):
         """
         Initialize WordPress Playwright automation.
         
@@ -343,11 +355,15 @@ class WordPressPlaywright:
             admin_url: WordPress admin panel URL (e.g., http://example.com/wp-admin/)
             username: WordPress username
             password: WordPress password
+            pause_ctrl: Optional PauseController for action-level pause checkpoints
+            execution_logger: Optional ExecutionLogger to check pause state
         """
         self.admin_url = normalize_wp_admin_root(admin_url)
         self.username = username
         self.password = password
         self.logger = PlaywrightLogger()
+        self.pause_ctrl = pause_ctrl
+        self.execution_logger = execution_logger
         
         # Parse base URL from admin_url
         parsed = urlparse(self.admin_url)
@@ -362,6 +378,9 @@ class WordPressPlaywright:
             True if login successful, False otherwise
         """
         try:
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+            
             self.logger.add_log("🔐 WordPress Login", "info", "")
             
             await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
@@ -379,6 +398,10 @@ class WordPressPlaywright:
             if not username_field or not password_field:
                 self.logger.add_log("❌ Login form not found", "error", "")
                 return False
+            
+            # Pause checkpoint before filling credentials
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
             
             await username_field.fill(self.username)
             await password_field.fill(self.password)
@@ -1433,6 +1456,9 @@ class WordPressPlaywright:
     ) -> dict[str, Any]:
         """Update SEO meta description with light mode enabled for speed."""
         try:
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+            
             page_slug, prep_err = await self._prepare_seo_post_editor(
                 page,
                 page_url,
@@ -1447,12 +1473,20 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
+            # Pause checkpoint before filling field
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+
             filled = await self._fill_seo_meta_description(page, meta_description)
             if not filled:
                 filled = await self._fill_seo_meta_description_fallback(page, meta_description)
             
             if not filled:
                 return {"status": "failed", "error": "Meta description field not found"}
+
+            # Pause checkpoint before saving
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
@@ -1484,6 +1518,9 @@ class WordPressPlaywright:
     ) -> dict[str, Any]:
         """Update SEO title with light mode enabled for speed."""
         try:
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+            
             page_slug, prep_err = await self._prepare_seo_post_editor(
                 page,
                 page_url,
@@ -1498,11 +1535,19 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
+            # Pause checkpoint before filling field
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
+
             filled = await self._fill_seo_meta_title(page, meta_title)
             if not filled:
                 filled = await self._fill_seo_meta_title_fallback(page, meta_title)
             if not filled:
                 return {"status": "failed", "error": "SEO title field not found"}
+
+            # Pause checkpoint before saving
+            if self.pause_ctrl is not None:
+                await self.pause_ctrl.wait_if_paused()
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")

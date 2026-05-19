@@ -1,6 +1,6 @@
 import threading
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 from dataclasses import dataclass, asdict
 
 
@@ -35,6 +35,11 @@ class ExecutionLogger:
         self._rows_completed: int = 0
         # Structured per-row results for live table rendering on the frontend.
         self._row_results: list[dict[str, Any]] = []
+        # Optional PauseController callback for action-level pause (set by caller)
+        self._on_pause_callback: Optional[Callable[[], None]] = None
+        self._on_resume_callback: Optional[Callable[[], None]] = None
+        # PauseController instance for async Playwright (set by API layer)
+        self._pause_controller: Optional[Any] = None
 
     def is_complete(self) -> bool:
         with self._lock:
@@ -48,14 +53,54 @@ class ExecutionLogger:
         with self._lock:
             return self._paused
 
+    def set_pause_callbacks(
+        self, on_pause: Optional[Callable[[], None]] = None, on_resume: Optional[Callable[[], None]] = None
+    ) -> None:
+        """
+        Register callbacks to notify PauseController.
+        
+        Called by the API layer to bridge ExecutionLogger pause state
+        to the async PauseController in the Playwright event loop.
+        """
+        with self._lock:
+            self._on_pause_callback = on_pause
+            self._on_resume_callback = on_resume
+
+    def set_pause_controller(self, controller: Any) -> None:
+        """
+        Set the PauseController instance for async pause checkpoints.
+        
+        Called by the API layer before starting Playwright batch execution.
+        """
+        with self._lock:
+            self._pause_controller = controller
+
     def pause(self) -> None:
         with self._lock:
             if not self._complete:
                 self._paused = True
+                cb = self._on_pause_callback
+        
+        # Call outside lock to avoid deadlock
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).error(f"Error calling pause callback: {e}")
 
     def resume(self) -> None:
         with self._lock:
             self._paused = False
+            cb = self._on_resume_callback
+        
+        # Call outside lock to avoid deadlock
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).error(f"Error calling resume callback: {e}")
 
     def resume_and_reset_complete(self) -> None:
         """Atomically clear both the paused and complete flags for resume."""

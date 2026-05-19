@@ -12,6 +12,7 @@ from app.services.run_pipeline import run_dry_run, run_execute
 from app.services.wp_site import rest_client
 from app.services.execution_logger import ExecutionLogger
 from app.services.execution_log_registry import get as get_execution_logger, register as register_execution
+from app.services.pause_controller import PauseController
 from app.services.excel_export import build_export_excel
 
 router = APIRouter(prefix="/api/run", tags=["run"])
@@ -25,6 +26,18 @@ def _run_dry_run_background(
     start_from_row: int = 0,
 ) -> None:
     try:
+        # Create PauseController with the event loop in this background thread
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop in this thread yet; create one for PauseController
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        pause_ctrl = PauseController(loop)
+        execution.set_pause_controller(pause_ctrl)
+        execution.set_pause_callbacks(on_pause=pause_ctrl.on_pause, on_resume=pause_ctrl.on_resume)
+        
         run_dry_run(
             body.site,
             body.grouped,
@@ -137,6 +150,18 @@ def _run_execute_background(
     start_from_row: int = 0,
 ) -> None:
     try:
+        # Create PauseController with the event loop in this background thread
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop in this thread yet; create one for PauseController
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        pause_ctrl = PauseController(loop)
+        execution.set_pause_controller(pause_ctrl)
+        execution.set_pause_callbacks(on_pause=pause_ctrl.on_pause, on_resume=pause_ctrl.on_resume)
+        
         run_execute(
             body.site,
             body.grouped,
