@@ -4,10 +4,18 @@ Verifies meta title changes.
 
 Action type: "meta_title"
 Strategy (cascading — stop at first match):
-  1. REST: GET .../wp/v2/posts/{post_id}?context=edit -> meta.rank_math_title
-  2. REST: same response -> yoast_head_json.title
-  3. HTML fallback: GET source_url -> <title> tag text
-Compare against detail["new_meta_title"]
+  1. REST: GET .../wp/v2/posts/{post_id}?context=edit
+       a. meta.rank_math_title          (Rank Math — registered postmeta)
+       b. meta._rank_math_title         (Rank Math — alternate key)
+       c. yoast_head_json.title         (Yoast SEO — rendered title)
+  2. HTML scrape: GET source_url (no auth) -> <title> tag text
+     Ground truth for both plugins. Note: Yoast and Rank Math append the site name
+     to rendered titles (e.g. "My Page - Site Name"), so comparison is substring-based
+     when the expected value doesn't include the suffix.
+
+Note: Rank Math's free plan may not register rank_math_title in the REST API
+?context=edit response. The HTML <title> scrape is the definitive check for
+Rank Math sites.
 """
 
 from __future__ import annotations
@@ -20,20 +28,31 @@ from skills.html_scraper import fetch_page_data
 
 
 def _normalise(s: str) -> str:
-    """
-    Normalise a title string for comparison.
-    - NFC unicode normalisation (resolves composed vs decomposed chars)
-    - Collapse all Unicode dash variants (en-dash, em-dash, figure dash, etc.) to plain hyphen
-    - Collapse multiple whitespace to single space
-    - Strip leading/trailing whitespace
-    - Lowercase
-    """
+    """Normalise for comparison: NFC, Unicode dashes → hyphen, collapse whitespace, lowercase."""
     s = unicodedata.normalize("NFC", s)
-    # Replace all Unicode dashes with plain hyphen
     s = re.sub(r"[‐-―−﹘﹣－]", "-", s)
-    # Collapse multiple spaces/tabs
     s = re.sub(r"\s+", " ", s)
     return s.strip().lower()
+
+
+def _title_matches(actual: str, expected: str) -> bool:
+    """
+    Compare actual rendered title against expected.
+
+    Both Yoast and Rank Math append the site name to the rendered <title>
+    (e.g. "My Page Title - Site Name"). The stored/expected value is the raw
+    title without the suffix.
+
+    Passes when:
+      - Exact normalised match, OR
+      - The normalised expected value is contained within the normalised actual value
+        (handles " - Site Name" suffix appended by either plugin).
+    """
+    n_actual = _normalise(actual)
+    n_expected = _normalise(expected)
+    if not n_expected:
+        return False
+    return n_actual == n_expected or n_expected in n_actual
 
 
 ACTION_TYPE = "meta_title"
@@ -90,45 +109,47 @@ async def _verify_row(row: ExecuteRowResult, client: WPRestClient) -> QARowResul
 
         base_result.expected = expected
 
-        # --- Layer 1: REST API via Rank Math meta field ---
+        # --- Layer 1: REST API (fast path — Yoast or Rank Math registered postmeta) ---
         if row.post_id is not None:
             try:
                 wp_data = await client.get_post_or_page(row.post_id)
-
-                # --- Layer 1: REST API via Rank Math meta field ---
                 meta_fields = wp_data.get("meta") or {}
-                rank_math_title = meta_fields.get("rank_math_title", "")
+
+                # Rank Math: stores raw title as rank_math_title (or _rank_math_title)
+                rank_math_title = (
+                    meta_fields.get("rank_math_title") or
+                    meta_fields.get("_rank_math_title") or
+                    ""
+                )
                 if rank_math_title:
                     base_result.actual = rank_math_title
                     base_result.method = "rest_api:rank_math_title"
-                    base_result.verified = (
-                        _normalise(rank_math_title) == _normalise(expected)
-                    )
+                    base_result.verified = _normalise(rank_math_title) == _normalise(expected)
                     return base_result
 
-                # --- Layer 2: REST API via Yoast head JSON ---
+                # Yoast: rendered title in yoast_head_json (includes site name suffix)
                 yoast = wp_data.get("yoast_head_json") or {}
                 yoast_title = yoast.get("title", "")
                 if yoast_title:
                     base_result.actual = yoast_title
                     base_result.method = "rest_api:yoast_head_json.title"
-                    base_result.verified = (
-                        _normalise(yoast_title) == _normalise(expected)
-                    )
+                    base_result.verified = _title_matches(yoast_title, expected)
                     return base_result
 
             except Exception:
-                # REST failed — fall through to HTML scrape
+                # REST unavailable — fall through to HTML scrape
                 pass
 
-        # --- Layer 3: HTML scrape fallback ---
+        # --- Layer 2: HTML scrape (ground truth for both plugins) ---
+        # For Rank Math free plan, rank_math_title may not be in the REST response.
+        # The rendered <title> tag is the definitive check — it's what Google indexes.
         if not source_url:
             base_result.error = "REST meta fields not found and no source_url for HTML fallback"
             return base_result
 
         page_data = await fetch_page_data(source_url)
         if page_data.error:
-            base_result.error = f"HTML fallback failed: {page_data.error}"
+            base_result.error = f"HTML scrape failed: {page_data.error}"
             return base_result
 
         actual_title = page_data.title
@@ -136,10 +157,12 @@ async def _verify_row(row: ExecuteRowResult, client: WPRestClient) -> QARowResul
         base_result.method = "html_scrape"
 
         if actual_title is None:
-            base_result.error = "No <title> tag found in HTML"
+            base_result.error = "No <title> tag found in HTML — title not saved to DB"
             return base_result
 
-        base_result.verified = _normalise(actual_title) == _normalise(expected)
+        # Both Yoast and Rank Math append " - Site Name" to the rendered <title>.
+        # Verify that the expected value is present within the rendered title.
+        base_result.verified = _title_matches(actual_title, expected)
         return base_result
 
     except Exception as exc:

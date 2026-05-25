@@ -73,6 +73,11 @@ async def run_qa(
             fields = (row.detail or {}).get("fields_updated") or []
             if "h1" not in fields:
                 return False
+        # meta_title and meta skipped rows were already correct — the WP REST API
+        # returns the fully rendered title (with site name appended) so comparing
+        # the raw stored value against yoast_head_json always produces false failures.
+        if row.action_type in ("meta_title", "meta") and row.outcome == "skipped":
+            return False
         return True
 
     rows_to_verify = [r for r in rows_to_verify if should_verify(r)]

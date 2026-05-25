@@ -860,6 +860,51 @@ class WordPressPlaywright:
                 pass
         await page.wait_for_timeout(50)
 
+    # ------------------------------------------------------------------ #
+    #  Plugin detection                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def _detect_seo_plugin(self, page: Page) -> str:
+        """
+        Detect which SEO plugin is active on the current editor page.
+
+        Returns:
+            "yoast"    — Yoast SEO (block or classic editor)
+            "rankmath" — Rank Math SEO (block or classic editor)
+            "unknown"  — neither detected
+        """
+        try:
+            result = await page.evaluate(
+                """() => {
+                    // Rank Math indicators
+                    if (
+                        document.querySelector('[class*="rank-math"]') ||
+                        document.querySelector('#rank-math-metabox') ||
+                        document.querySelector('.rank-math-metabox') ||
+                        document.querySelector('[id^="rank-math"]') ||
+                        document.querySelector('button[aria-label*="Rank Math"]') ||
+                        document.querySelector('#rank_math_title') ||
+                        document.querySelector('#rank_math_description')
+                    ) { return 'rankmath'; }
+                    // Yoast indicators
+                    if (
+                        document.querySelector('#wpseo_meta') ||
+                        document.querySelector('[class*="yoast"]') ||
+                        document.querySelector('[class*="wpseo"]') ||
+                        document.querySelector('#yoast-google-preview-title-metabox') ||
+                        document.querySelector('#yoast-google-preview-description-metabox')
+                    ) { return 'yoast'; }
+                    return 'unknown';
+                }"""
+            )
+            return result if result in ("yoast", "rankmath") else "unknown"
+        except Exception:
+            return "unknown"
+
+    # ------------------------------------------------------------------ #
+    #  Yoast helpers                                                       #
+    # ------------------------------------------------------------------ #
+
     async def _ensure_yoast_metabox_open(self, page: Page) -> None:
         """Expand classic Yoast postbox if WordPress left it closed (snippet fields stay display:none)."""
         box = page.locator("#wpseo_meta").first
@@ -1028,6 +1073,312 @@ class WordPressPlaywright:
         except Exception as e:
             return False
 
+    # ------------------------------------------------------------------ #
+    #  Rank Math helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    async def _ensure_rankmath_sidebar_open(self, page: Page) -> bool:
+        """
+        Make sure the Rank Math sidebar panel is visible in the block editor.
+        Returns True if the sidebar is confirmed open (or was already open).
+        """
+        try:
+            # If the Rank Math sidebar panel is already visible, we're done.
+            rm_panel = page.locator(
+                ".rank-math-metabox, #rank-math-metabox, [class*='rank-math-sidebar']"
+            ).first
+            if await rm_panel.count() > 0 and await rm_panel.is_visible():
+                return True
+
+            # Try clicking the Rank Math score/toggle button in the top bar.
+            toggle_candidates = [
+                "button[aria-label*='Rank Math']",
+                ".rank-math-score",
+                "[class*='rank-math'] button[aria-label]",
+                "button[class*='rank-math']",
+            ]
+            for sel in toggle_candidates:
+                btn = page.locator(sel).first
+                try:
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(timeout=4000)
+                        await page.wait_for_timeout(600)
+                        break
+                except Exception:
+                    continue
+
+            # Also try activating via the sidebar tab if it exists.
+            try:
+                side = page.locator(".interface-complementary-area")
+                if await side.count() > 0:
+                    tab = side.get_by_role("tab", name=re.compile(r"Rank\s*Math", re.I)).first
+                    if await tab.count() > 0 and await tab.is_visible():
+                        if (await tab.get_attribute("aria-selected")) != "true":
+                            await tab.click(timeout=4000)
+                            await page.wait_for_timeout(450)
+            except Exception:
+                pass
+
+            await page.wait_for_timeout(300)
+            return True
+        except Exception:
+            return False
+
+    async def _open_rankmath_snippet_editor(self, page: Page) -> bool:
+        """
+        Click the 'Edit Snippet' button inside the Rank Math sidebar panel
+        and wait for the Preview Snippet Editor modal to appear.
+        Returns True if the modal is confirmed open.
+        """
+        edit_snippet_selectors = [
+            "button:has-text('Edit Snippet')",
+            ".rank-math-edit-snippet",
+            ".rank-math-snippet-editor-button",
+            "[class*='rank-math'] button:has-text('Edit Snippet')",
+            "[class*='rank-math-preview'] button",
+        ]
+
+        clicked = False
+        for sel in edit_snippet_selectors:
+            btn = page.locator(sel).first
+            try:
+                if await btn.count() > 0 and await btn.is_visible():
+                    await self._safe_scroll_into_view(page, btn, timeout_ms=2000)
+                    await btn.click(timeout=5000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            self.logger.add_log("⚠️ Rank Math 'Edit Snippet' button not found", "warning", "")
+            return False
+
+        # Wait for the modal/overlay to appear.
+        # DevTools confirmed: class="components-modal__frame rank-math-modal"
+        modal_selectors = [
+            ".rank-math-modal",
+            ".components-modal__frame.rank-math-modal",
+            "[class*='rank-math-modal']",
+            ".rank-math-snippet-editor",
+            "[class*='rank-math-snippet-editor']",
+            "[class*='rank-math'] [role='dialog']",
+            "#rank-math-editor-title",  # Title input visible = modal is open
+        ]
+        for sel in modal_selectors:
+            try:
+                await page.wait_for_selector(sel, state="visible", timeout=5000)
+                self.logger.add_log("✅ Rank Math snippet editor modal open", "success", "")
+                return True
+            except Exception:
+                continue
+
+        # Modal may render without a strict class — wait a moment and trust it.
+        await page.wait_for_timeout(800)
+        return True
+
+    async def _fill_rankmath_block_editor_title(self, page: Page, meta_title: str) -> bool:
+        """
+        Fill the SEO title inside the Rank Math block-editor 'Preview Snippet Editor' modal.
+        Assumes the modal is already open (call _open_rankmath_snippet_editor first).
+        """
+        title_selectors = [
+            # Confirmed from DevTools: label for="rank-math-editor-title"
+            "#rank-math-editor-title",
+            "input#rank-math-editor-title",
+            "input[id='rank-math-editor-title']",
+            # Modal container variants
+            ".rank-math-modal input#rank-math-editor-title",
+            "[class*='rank-math-modal'] input#rank-math-editor-title",
+            # class-based fallbacks
+            ".rank-math-modal input.rank-math-title",
+            ".rank-math-snippet-editor input.rank-math-title",
+            "[class*='rank-math-snippet'] input[type='text']:first-of-type",
+            "[class*='rank-math'] input.rank-math-title",
+            # Generic: any text input inside the open Rank Math modal overlay
+            "[class*='rank-math-snippet-editor'] input[type='text']",
+            "[class*='rank-math-modal'] input[type='text']",
+            ".components-modal__frame.rank-math-modal input[type='text']",
+        ]
+        # The Title field-group may be collapsed (has a chevron expand button).
+        # Expand it first if the input is not yet visible.
+        try:
+            title_input_check = page.locator("#rank-math-editor-title").first
+            if await title_input_check.count() > 0 and not await title_input_check.is_visible():
+                # Find the expand/chevron button in the title field-group and click it.
+                chevron = page.locator(
+                    "[class*='rank-math'] [class*='field-group']:has(label[for='rank-math-editor-title']) button, "
+                    "[class*='rank-math'] [class*='field-group']:has(label[for='rank-math-editor-title']) [class*='variable-group']"
+                ).first
+                if await chevron.count() > 0:
+                    await chevron.click(timeout=3000)
+                    await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        for sel in title_selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() == 0:
+                    continue
+                if not await loc.is_visible():
+                    continue
+                await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                await loc.click(timeout=4000)
+                await loc.select_text()
+                await loc.fill(meta_title, timeout=8000)
+                await loc.evaluate("""(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""")
+                self.logger.add_log("✅ Rank Math SEO title filled", "success", f"{len(meta_title)} chars")
+                return True
+            except Exception:
+                continue
+
+        # Fallback: classic-editor postmeta field (visible when block editor is not active).
+        for sel in ("#rank_math_title", "input[name='rank_math_title']"):
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                    await loc.fill(meta_title, timeout=8000)
+                    await loc.evaluate("""(el) => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }""")
+                    self.logger.add_log("✅ Rank Math SEO title filled (classic)", "success", f"{len(meta_title)} chars")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _fill_rankmath_block_editor_description(self, page: Page, meta_description: str) -> bool:
+        """
+        Fill the meta description inside the Rank Math block-editor 'Preview Snippet Editor' modal.
+        Assumes the modal is already open (call _open_rankmath_snippet_editor first).
+        """
+        desc_selectors = [
+            # Confirmed modal class from DevTools: components-modal__frame rank-math-modal
+            ".rank-math-modal textarea",
+            ".components-modal__frame.rank-math-modal textarea",
+            "[class*='rank-math-modal'] textarea",
+            ".rank-math-modal textarea.rank-math-description",
+            ".rank-math-snippet-editor textarea.rank-math-description",
+            "[class*='rank-math-snippet'] textarea",
+            "[class*='rank-math'] textarea.rank-math-description",
+            "[class*='rank-math-snippet-editor'] textarea",
+        ]
+        for sel in desc_selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() == 0:
+                    continue
+                if not await loc.is_visible():
+                    continue
+                await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                await loc.click(timeout=4000)
+                await loc.select_text()
+                await loc.fill(meta_description, timeout=8000)
+                await loc.evaluate("""(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""")
+                self.logger.add_log("✅ Rank Math meta description filled", "success", f"{len(meta_description)} chars")
+                return True
+            except Exception:
+                continue
+
+        # Fallback: classic-editor postmeta field.
+        for sel in ("#rank_math_description", "textarea[name='rank_math_description']"):
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
+                    await loc.fill(meta_description, timeout=8000)
+                    await loc.evaluate("""(el) => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    }""")
+                    self.logger.add_log("✅ Rank Math meta description filled (classic)", "success", f"{len(meta_description)} chars")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _fill_rankmath_seo_fields(
+        self,
+        page: Page,
+        *,
+        meta_title: str | None = None,
+        meta_description: str | None = None,
+    ) -> dict[str, bool]:
+        """
+        Full Rank Math block-editor flow: open sidebar → click Edit Snippet →
+        fill title and/or description inside the modal → blur to persist.
+
+        Returns dict with keys 'title' and 'description' (True = filled successfully).
+        """
+        results = {"title": False, "description": False}
+
+        await self._ensure_rankmath_sidebar_open(page)
+        await page.wait_for_timeout(300)
+
+        modal_opened = await self._open_rankmath_snippet_editor(page)
+        if not modal_opened:
+            self.logger.add_log("❌ Rank Math snippet modal did not open", "error", "")
+            return results
+
+        if meta_title is not None:
+            results["title"] = await self._fill_rankmath_block_editor_title(page, meta_title)
+
+        if meta_description is not None:
+            results["description"] = await self._fill_rankmath_block_editor_description(page, meta_description)
+
+        # Dismiss the modal so Rank Math persists values to its React store.
+        # DO NOT use Escape — it can revert the React state in some RM versions.
+        # Prefer clicking the modal's own close/X button.
+        modal_closed = False
+        try:
+            close_candidates = [
+                # The modal's header X button (Gutenberg components-modal__header pattern)
+                ".rank-math-modal .components-modal__header button",
+                ".components-modal__frame.rank-math-modal .components-modal__header button",
+                # aria-label close buttons
+                "button[aria-label='Close']",
+                "button[aria-label='close']",
+                ".rank-math-modal button[aria-label]",
+                "[class*='rank-math-snippet'] button[aria-label]",
+            ]
+            for sel in close_candidates:
+                btn = page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=3000)
+                    modal_closed = True
+                    break
+        except Exception:
+            pass
+
+        if not modal_closed:
+            # Click outside the modal to blur/commit — safer than Escape which can revert
+            try:
+                await page.click("body", position={"x": 10, "y": 10}, timeout=2000)
+            except Exception:
+                pass
+
+        # Give React time to commit the updated state to the Gutenberg store
+        # before the post save is triggered. 800ms is enough for React batching.
+        await page.wait_for_timeout(800)
+        return results
+
+    # ------------------------------------------------------------------ #
+    #  Shared scroll helper                                                #
+    # ------------------------------------------------------------------ #
+
     async def _scroll_to_block_editor_metaboxes(self, page: Page) -> None:
         """Gutenberg loads SEO fields under **Meta Boxes** at the bottom — scroll there first."""
         for sel in (
@@ -1052,10 +1403,20 @@ class WordPressPlaywright:
         await page.wait_for_timeout(180)
 
 
-    async def _fill_seo_meta_description(self, page: Page, meta_description: str) -> bool:
+    async def _fill_seo_meta_description(self, page: Page, meta_description: str, plugin: str = "unknown") -> bool:
         """
-        Fill meta description with comprehensive selector fallbacks.
+        Fill meta description — routes to the correct plugin flow.
+
+        plugin="yoast"    → Yoast preview contenteditable → classic textarea fallback
+        plugin="rankmath" → Rank Math Edit Snippet modal flow
+        plugin="unknown"  → tries Yoast first, then Rank Math
         """
+        # ---- Rank Math path ------------------------------------------ #
+        if plugin == "rankmath":
+            result = await self._fill_rankmath_seo_fields(page, meta_description=meta_description)
+            return result["description"]
+
+        # ---- Yoast path (unchanged) ----------------------------------- #
         await page.wait_for_timeout(100)
         await self._scroll_to_block_editor_metaboxes(page)
         await self._ensure_yoast_metabox_open(page)
@@ -1105,20 +1466,18 @@ class WordPressPlaywright:
         except Exception:
             pass
 
-        actual_input_selectors = [
+        yoast_selectors = [
             "textarea[name='_yoast_wpseo_metadesc']",
             "input[name='_yoast_wpseo_metadesc']",
             "textarea#yoast_wpseo_metadesc",
             "input#yoast_wpseo_metadesc",
-            "textarea[name='rank_math_description']",
-            "input[name='rank_math_description']",
             "#wpseo_meta textarea",
             "#wpseo_meta input",
             "textarea[placeholder*='description' i]",
             "input[placeholder*='description' i]",
         ]
 
-        for selector in actual_input_selectors:
+        for selector in yoast_selectors:
             try:
                 loc = page.locator(selector).first
                 if await loc.count() > 0:
@@ -1145,21 +1504,22 @@ class WordPressPlaywright:
             except Exception:
                 continue
 
+        # ---- Unknown plugin: try Rank Math as last resort ------------- #
+        if plugin == "unknown":
+            result = await self._fill_rankmath_seo_fields(page, meta_description=meta_description)
+            if result["description"]:
+                return True
+
         return False
 
     async def _fill_seo_meta_description_fallback(self, page: Page, meta_description: str) -> bool:
-        """
-        Fallback for older Yoast versions or different DOM structures.
-        Tries textarea selectors with extended options.
-        """
+        """Fallback for older / classic-editor Yoast versions."""
         selectors = [
             "#wpseo_meta textarea#yoast_wpseo_metadesc",
             "#wpseo_meta textarea[name='_yoast_wpseo_metadesc']",
             "#wpseo_meta textarea",
             "textarea#yoast_wpseo_metadesc",
             "textarea[name='_yoast_wpseo_metadesc']",
-            "#rank_math_description",
-            "textarea[name='rank_math_description']",
             ".wpseo-meta-description textarea",
             "[data-test-id*='description'] textarea",
             "[data-test-id*='description'] input",
@@ -1170,25 +1530,25 @@ class WordPressPlaywright:
             try:
                 if await loc.count() == 0:
                     continue
-                
+
                 is_visible = await loc.is_visible()
                 if not is_visible:
                     continue
-                
+
                 try:
                     await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
                 except Exception:
                     pass
-                
+
                 await loc.click(timeout=5000)
                 await loc.fill(meta_description, timeout=15000, force=True)
-                
+
                 await loc.evaluate("""(el) => {
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     el.dispatchEvent(new Event('blur', { bubbles: true }));
                 }""")
-                
+
                 self.logger.add_log(
                     "✅ Meta description filled (fallback)",
                     "success",
@@ -1197,11 +1557,23 @@ class WordPressPlaywright:
                 return True
             except Exception:
                 continue
-        
+
         return False
 
-    async def _fill_seo_meta_title(self, page: Page, meta_title: str) -> bool:
-        """Fill SEO title with comprehensive selector fallbacks."""
+    async def _fill_seo_meta_title(self, page: Page, meta_title: str, plugin: str = "unknown") -> bool:
+        """
+        Fill SEO title — routes to the correct plugin flow.
+
+        plugin="yoast"    → Yoast preview contenteditable → classic input fallback
+        plugin="rankmath" → Rank Math Edit Snippet modal flow
+        plugin="unknown"  → tries Yoast first, then Rank Math
+        """
+        # ---- Rank Math path ------------------------------------------ #
+        if plugin == "rankmath":
+            result = await self._fill_rankmath_seo_fields(page, meta_title=meta_title)
+            return result["title"]
+
+        # ---- Yoast path (unchanged) ----------------------------------- #
         await page.wait_for_timeout(100)
         await self._scroll_to_block_editor_metaboxes(page)
         await self._ensure_yoast_metabox_open(page)
@@ -1251,20 +1623,18 @@ class WordPressPlaywright:
         except Exception:
             pass
 
-        actual_input_selectors = [
+        yoast_selectors = [
             "input[name='_yoast_wpseo_title']",
             "input#yoast_wpseo_title",
             "textarea[name='_yoast_wpseo_title']",
             "textarea#yoast_wpseo_title",
-            "input[name='rank_math_title']",
-            "input#rank_math_title",
             "#wpseo_meta input[type='text']",
             "#wpseo_meta textarea",
             "input[placeholder*='title' i]",
             "textarea[placeholder*='title' i]",
         ]
 
-        for selector in actual_input_selectors:
+        for selector in yoast_selectors:
             try:
                 loc = page.locator(selector).first
                 if await loc.count() > 0:
@@ -1291,17 +1661,21 @@ class WordPressPlaywright:
             except Exception:
                 continue
 
+        # ---- Unknown plugin: try Rank Math as last resort ------------- #
+        if plugin == "unknown":
+            result = await self._fill_rankmath_seo_fields(page, meta_title=meta_title)
+            if result["title"]:
+                return True
+
         return False
 
     async def _fill_seo_meta_title_fallback(self, page: Page, meta_title: str) -> bool:
-        """Fallback: classic Yoast / Rank Math input fields for SEO title."""
+        """Fallback for older / classic-editor Yoast versions."""
         selectors = [
             "#wpseo_meta input#yoast_wpseo_title",
             "#wpseo_meta input[name='_yoast_wpseo_title']",
             "input#yoast_wpseo_title",
             "input[name='_yoast_wpseo_title']",
-            "#rank_math_title",
-            "input[name='rank_math_title']",
             ".wpseo-meta-title input",
             "[data-test-id*='title'] input",
             "#wpseo_meta textarea[name='_yoast_wpseo_title']",
@@ -1311,25 +1685,25 @@ class WordPressPlaywright:
             try:
                 if await loc.count() == 0:
                     continue
-                
+
                 is_visible = await loc.is_visible()
                 if not is_visible:
                     continue
-                
+
                 try:
                     await self._safe_scroll_into_view(page, loc, timeout_ms=2000)
                 except Exception:
                     pass
-                
+
                 await loc.click(timeout=5000)
                 await loc.fill(meta_title, timeout=15000, force=True)
-                
+
                 await loc.evaluate("""(el) => {
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     el.dispatchEvent(new Event('blur', { bubbles: true }));
                 }""")
-                
+
                 self.logger.add_log("✅ SEO title filled (fallback)", "success", sel)
                 return True
             except Exception:
@@ -1433,8 +1807,14 @@ class WordPressPlaywright:
         shot_prefix_editor: str,
         editor_loaded_log: str,
         job_context: str | None = None,
-    ) -> tuple[str, dict[str, Any] | None]:
-        """Open editor with proper Yoast load detection."""
+    ) -> tuple[str, dict[str, Any] | None, str]:
+        """
+        Open the WordPress post/page editor and detect the active SEO plugin.
+
+        Returns:
+            (page_slug, error_dict_or_None, plugin)
+            plugin is "yoast", "rankmath", or "unknown"
+        """
         nav_ms = 30000 if light_mode else 45000
         page.set_default_timeout(nav_ms)
 
@@ -1450,6 +1830,31 @@ class WordPressPlaywright:
             _playwright_log_details(f"slug={page_slug!r}", job_context),
         )
 
+        # Selectors that confirm the SEO plugin panel has mounted (Yoast OR Rank Math).
+        _seo_ready_selectors = (
+            # Yoast — block editor
+            "#wpseo_meta",
+            ".edit-post-layout__metaboxes",
+            "#yoast-google-preview-description-metabox",
+            "#yoast-google-preview-title-metabox",
+            ".wpseo-metabox-content",
+            # Rank Math — block editor sidebar / metabox
+            "[class*='rank-math']",
+            ".rank-math-metabox",
+            "#rank-math-metabox",
+            "button[aria-label*='Rank Math']",
+        )
+
+        async def _wait_for_seo_panel() -> None:
+            for _sel in _seo_ready_selectors:
+                try:
+                    await page.wait_for_selector(_sel, state="visible", timeout=3000)
+                    return
+                except Exception:
+                    pass
+            # Neither plugin found visible yet — give JS a moment to finish mounting.
+            await page.wait_for_timeout(1200)
+
         if post_id is not None:
             edit_url = urljoin(self.admin_url, f"post.php?post={int(post_id)}&action=edit")
             self.logger.add_log(
@@ -1458,24 +1863,17 @@ class WordPressPlaywright:
                 _playwright_log_details(edit_url, job_context),
             )
             await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
-            try:
-                await page.wait_for_selector(
-                    "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
-                    state="visible",
-                    timeout=15000,
-                )
-            except Exception:
-                pass
+            await _wait_for_seo_panel()
         else:
             if not page_slug:
-                return ("", {"status": "failed", "error": "No post_id and no URL path segment"})
+                return ("", {"status": "failed", "error": "No post_id and no URL path segment"}, "unknown")
 
             page_link = await self._find_row_title_in_list(page, page_slug, post_type="page")
             if page_link is None:
                 page_link = await self._find_row_title_in_list(page, page_slug, post_type="post")
 
             if page_link is None:
-                return ("", {"status": "failed", "error": f"Content not found for slug '{page_slug}'"})
+                return ("", {"status": "failed", "error": f"Content not found for slug '{page_slug}'"}, "unknown")
 
             self.logger.add_log(
                 "✅ Matched; opening editor",
@@ -1487,21 +1885,15 @@ class WordPressPlaywright:
             except Exception:
                 pass
             await page_link.click(timeout=10000)
-            try:
-                await page.wait_for_selector(
-                    "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
-                    state="visible",
-                    timeout=15000,
-                )
-            except Exception:
-                pass
+            await _wait_for_seo_panel()
 
+        plugin = await self._detect_seo_plugin(page)
         self.logger.add_log(
             editor_loaded_log,
             "success",
-            _playwright_log_details("", job_context),
+            _playwright_log_details(f"plugin={plugin}", job_context),
         )
-        return (page_slug, None)
+        return (page_slug, None, plugin)
 
     async def update_meta_description(
         self,
@@ -1513,12 +1905,12 @@ class WordPressPlaywright:
         light_mode: bool = False,
         job_context: str | None = None,
     ) -> dict[str, Any]:
-        """Update SEO meta description with light mode enabled for speed."""
+        """Update SEO meta description for Yoast or Rank Math."""
         try:
             if self.pause_ctrl is not None:
                 await self.pause_ctrl.wait_if_paused()
-            
-            page_slug, prep_err = await self._prepare_seo_post_editor(
+
+            page_slug, prep_err, plugin = await self._prepare_seo_post_editor(
                 page,
                 page_url,
                 post_id,
@@ -1533,23 +1925,31 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
-            # Pause checkpoint before filling field
             if self.pause_ctrl is not None:
                 await self.pause_ctrl.wait_if_paused()
 
-            filled = await self._fill_seo_meta_description(page, meta_description)
-            if not filled:
+            filled = await self._fill_seo_meta_description(page, meta_description, plugin=plugin)
+            if not filled and plugin != "rankmath":
+                # Yoast classic-editor fallback only — Rank Math already tried its own fallback.
                 filled = await self._fill_seo_meta_description_fallback(page, meta_description)
-            
+
             if not filled:
                 return {"status": "failed", "error": "Meta description field not found"}
 
-            # Pause checkpoint before saving
             if self.pause_ctrl is not None:
                 await self.pause_ctrl.wait_if_paused()
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
+
+            try:
+                await page.wait_for_selector(
+                    ".notice-success, #message.updated, .components-snackbar",
+                    state="visible",
+                    timeout=4000,
+                )
+            except Exception:
+                pass
 
             self.logger.add_log(
                 "✅ Meta description complete",
@@ -1583,12 +1983,12 @@ class WordPressPlaywright:
         light_mode: bool = False,
         job_context: str | None = None,
     ) -> dict[str, Any]:
-        """Update SEO title with light mode enabled for speed."""
+        """Update SEO title for Yoast or Rank Math."""
         try:
             if self.pause_ctrl is not None:
                 await self.pause_ctrl.wait_if_paused()
-            
-            page_slug, prep_err = await self._prepare_seo_post_editor(
+
+            page_slug, prep_err, plugin = await self._prepare_seo_post_editor(
                 page,
                 page_url,
                 post_id,
@@ -1603,22 +2003,30 @@ class WordPressPlaywright:
             if prep_err:
                 return prep_err
 
-            # Pause checkpoint before filling field
             if self.pause_ctrl is not None:
                 await self.pause_ctrl.wait_if_paused()
 
-            filled = await self._fill_seo_meta_title(page, meta_title)
-            if not filled:
+            filled = await self._fill_seo_meta_title(page, meta_title, plugin=plugin)
+            if not filled and plugin != "rankmath":
+                # Yoast classic-editor fallback only — Rank Math already tried its own fallback.
                 filled = await self._fill_seo_meta_title_fallback(page, meta_title)
             if not filled:
                 return {"status": "failed", "error": "SEO title field not found"}
 
-            # Pause checkpoint before saving
             if self.pause_ctrl is not None:
                 await self.pause_ctrl.wait_if_paused()
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
+
+            try:
+                await page.wait_for_selector(
+                    ".notice-success, #message.updated, .components-snackbar",
+                    state="visible",
+                    timeout=4000,
+                )
+            except Exception:
+                pass
 
             self.logger.add_log(
                 "✅ SEO title complete",

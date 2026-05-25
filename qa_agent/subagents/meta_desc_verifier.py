@@ -4,10 +4,16 @@ Verifies meta description changes.
 
 Action type: "meta"
 Strategy (cascading — stop at first match):
-  1. REST: GET .../wp/v2/posts/{post_id}?context=edit -> meta.rank_math_description
-  2. REST: same response -> yoast_head_json.description
-  3. HTML fallback: GET source_url -> <meta name="description" content="...">
-Compare against detail["new_meta_description"]
+  1. REST: GET .../wp/v2/posts/{post_id}?context=edit
+       a. meta.rank_math_description          (Rank Math — registered postmeta)
+       b. meta._rank_math_description         (Rank Math — alternate key)
+       c. yoast_head_json.description         (Yoast SEO)
+  2. HTML scrape: GET source_url (no auth) -> <meta name="description" content="...">
+     This is the ground truth for both plugins — what Google actually sees.
+
+Note: Rank Math's free plan may not register rank_math_description in the REST
+API ?context=edit response. The HTML scrape is the definitive verification layer
+for Rank Math sites. The REST layers are fast-path shortcuts when available.
 """
 
 from __future__ import annotations
@@ -81,45 +87,48 @@ async def _verify_row(row: ExecuteRowResult, client: WPRestClient) -> QARowResul
 
         base_result.expected = expected
 
-        # --- Layer 1: REST API via Rank Math meta field ---
+        # --- Layer 1: REST API (fast path — Yoast or Rank Math registered postmeta) ---
         if row.post_id is not None:
             try:
                 wp_data = await client.get_post_or_page(row.post_id)
-
-                # --- Layer 1: REST API via Rank Math meta field ---
                 meta_fields = wp_data.get("meta") or {}
-                rank_math_desc = meta_fields.get("rank_math_description", "")
+
+                # Rank Math: stores as rank_math_description (or _rank_math_description)
+                rank_math_desc = (
+                    meta_fields.get("rank_math_description") or
+                    meta_fields.get("_rank_math_description") or
+                    ""
+                )
                 if rank_math_desc:
                     base_result.actual = rank_math_desc
                     base_result.method = "rest_api:rank_math_description"
-                    base_result.verified = (
-                        _normalise(rank_math_desc) == _normalise(expected)
-                    )
+                    base_result.verified = _normalise(rank_math_desc) == _normalise(expected)
                     return base_result
 
-                # --- Layer 2: REST API via Yoast head JSON ---
+                # Yoast: rendered description in yoast_head_json
                 yoast = wp_data.get("yoast_head_json") or {}
                 yoast_desc = yoast.get("description", "")
                 if yoast_desc:
                     base_result.actual = yoast_desc
                     base_result.method = "rest_api:yoast_head_json.description"
-                    base_result.verified = (
-                        _normalise(yoast_desc) == _normalise(expected)
-                    )
+                    base_result.verified = _normalise(yoast_desc) == _normalise(expected)
                     return base_result
 
             except Exception:
-                # REST failed — fall through to HTML scrape
+                # REST unavailable — fall through to HTML scrape
                 pass
 
-        # --- Layer 3: HTML scrape fallback ---
+        # --- Layer 2: HTML scrape (ground truth for both plugins) ---
+        # This is the definitive check — it reads what Google actually sees.
+        # For Rank Math free plan this is the primary verification method since
+        # rank_math_description is not always exposed via the REST API.
         if not source_url:
             base_result.error = "REST meta fields not found and no source_url for HTML fallback"
             return base_result
 
         page_data = await fetch_page_data(source_url)
         if page_data.error:
-            base_result.error = f"HTML fallback failed: {page_data.error}"
+            base_result.error = f"HTML scrape failed: {page_data.error}"
             return base_result
 
         actual_meta = page_data.meta_description
@@ -127,7 +136,7 @@ async def _verify_row(row: ExecuteRowResult, client: WPRestClient) -> QARowResul
         base_result.method = "html_scrape"
 
         if actual_meta is None:
-            base_result.error = "No <meta name='description'> found in HTML"
+            base_result.error = "No <meta name='description'> found in HTML — description not saved to DB"
             return base_result
 
         base_result.verified = _normalise(actual_meta) == _normalise(expected)

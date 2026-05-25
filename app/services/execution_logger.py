@@ -105,10 +105,17 @@ class ExecutionLogger:
                 _logging.getLogger(__name__).error(f"Error calling resume callback: {e}")
 
     def resume_and_reset_complete(self) -> None:
-        """Atomically clear both the paused and complete flags for resume."""
+        """Clear paused/complete flags and flush stored row results for resume.
+
+        Row results from the first execution half are already in the frontend's
+        rowResults state. Clearing them here prevents the SSE stream from
+        replaying them when the new connection opens, which would double every
+        row in the UI.
+        """
         with self._lock:
             self._paused = False
             self._complete = False
+            self._row_results = []
 
     def set_rows_completed(self, n: int) -> None:
         with self._lock:

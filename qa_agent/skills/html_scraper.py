@@ -45,12 +45,20 @@ async def fetch_page_data(url: str) -> PageData:
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (compatible; QAAgent/1.0; +https://qa-agent)"
-                )
+                ),
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
             },
         ) as client:
             response = await client.get(url)
             page.status_code = response.status_code
             response.raise_for_status()
+
+            # Detect redirect to WP login page (HTTP 200 after redirect)
+            final_url = str(response.url)
+            if "wp-login" in final_url or "action=login" in final_url:
+                page.error = f"Page requires authentication (redirected to: {final_url})"
+                return page
 
             soup = BeautifulSoup(response.text, "html.parser")
 
