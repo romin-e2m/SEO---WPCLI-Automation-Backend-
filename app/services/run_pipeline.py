@@ -58,13 +58,28 @@ def _max_run_rows() -> int:
         return 500
 
 
-def _seo_playwright_worker_count() -> int:
-    """Always 1 — single Playwright browser, single login, sequential task execution."""
-    return 1
+def _seo_playwright_max_workers() -> int:
+    """Absolute ceiling on parallel Playwright workers. Controlled by PLAYWRIGHT_SEO_MAX_WORKERS
+    (falls back to PLAYWRIGHT_SEO_WORKERS for backwards compatibility). Default 8."""
+    raw = os.getenv("PLAYWRIGHT_SEO_MAX_WORKERS") or os.getenv("PLAYWRIGHT_SEO_WORKERS", "8")
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 8
+
+
+def _seo_playwright_target_rows_per_worker() -> int:
+    """Target number of rows each worker should handle. Auto-scales worker count upward
+    as row count grows. Controlled by PLAYWRIGHT_SEO_TARGET_ROWS_PER_WORKER. Default 10."""
+    raw = os.getenv("PLAYWRIGHT_SEO_TARGET_ROWS_PER_WORKER", "10")
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 10
 
 
 def _seo_playwright_min_rows_per_worker() -> int:
-    """Avoid too many browsers for few rows (each browser still needs its own login)."""
+    """Minimum rows per worker — prevents over-spawning for tiny batches."""
     raw = os.getenv("PLAYWRIGHT_SEO_MIN_ROWS_PER_WORKER", "3")
     try:
         return max(1, int(raw))
@@ -82,17 +97,28 @@ def _seo_playwright_login_gap_sec() -> float:
 
 
 def _effective_seo_worker_count(playwright_job_count: int) -> int:
+    """Auto-scale workers based on actual row count.
+
+    Formula: ceil(jobs / target_rows_per_worker), capped at PLAYWRIGHT_SEO_MAX_WORKERS.
+    Small-batch guard: never create more workers than jobs // MIN_ROWS_PER_WORKER allows.
+
+    Examples with defaults (target=10, max=8, min_rows=3):
+      21 rows  -> ceil(21/10)=3,  max_useful=7,  cap=8  -> 3 workers
+      50 rows  -> ceil(50/10)=5,  max_useful=16, cap=8  -> 5 workers
+      100 rows -> ceil(100/10)=10, max_useful=33, cap=8 -> 8 workers
+      500 rows -> ceil(500/10)=50, max_useful=166, cap=8 -> 8 workers
     """
-    Honor PLAYWRIGHT_SEO_WORKERS but cap workers when rows are few.
-    Example: 6 jobs, min 3 rows/worker -> at most 2 workers even if env says 5.
-    """
-    configured = _seo_playwright_worker_count()
+    import math
     jobs = max(0, playwright_job_count)
     if jobs == 0:
         return 1
+    target = _seo_playwright_target_rows_per_worker()
+    absolute_max = _seo_playwright_max_workers()
     min_rows = _seo_playwright_min_rows_per_worker()
+    auto_workers = math.ceil(jobs / target)
+    # Small-batch guard: don't spawn more workers than the min-rows rule allows.
     max_useful = max(1, jobs // min_rows)
-    return min(configured, jobs, max_useful)
+    return min(auto_workers, max_useful, absolute_max)
 
 
 def _s(v: Any) -> str:
@@ -1804,7 +1830,6 @@ def _exec_seo_combined_playwright_batch(
     if not works:
         return [r for r in res_m if r is not None] + [r for r in res_t if r is not None]
 
-    configured = _seo_playwright_worker_count()
     row_units = max(len(works), len(jobs_m) + len(jobs_t), len(meta_rows) + len(title_rows))
     worker_count = _effective_seo_worker_count(row_units)
     if execution_logger is not None:
@@ -1812,8 +1837,8 @@ def _exec_seo_combined_playwright_batch(
             "meta_playwright_combined_pool",
             "pending",
             f"{len(works)} post(s), {len(jobs_m) + len(jobs_t)} Playwright job(s), "
-            f"{worker_count} worker(s) (PLAYWRIGHT_SEO_WORKERS={configured}, "
-            f"min {_seo_playwright_min_rows_per_worker()} rows/worker)",
+            f"{worker_count} worker(s) (max={_seo_playwright_max_workers()}, "
+            f"target={_seo_playwright_target_rows_per_worker()} rows/worker)",
         )
 
     pause_ctrl = _seo_playwright_pool_pause_ctrl(execution_logger)
@@ -2103,15 +2128,14 @@ def _exec_seo_playwright_worker_pool(
     if not jobs:
         return [r for r in results if r is not None]
 
-    configured = _seo_playwright_worker_count()
     worker_count = _effective_seo_worker_count(len(jobs))
     if execution_logger is not None:
         execution_logger.log_sync(
             f"{spec.action_type}_playwright_pool",
             "pending",
             f"{len(jobs)} Playwright job(s), {worker_count} worker(s) "
-            f"(PLAYWRIGHT_SEO_WORKERS={configured}, "
-            f"min {_seo_playwright_min_rows_per_worker()} rows/worker)",
+            f"(max={_seo_playwright_max_workers()}, "
+            f"target={_seo_playwright_target_rows_per_worker()} rows/worker)",
         )
 
     pause_ctrl = _seo_playwright_pool_pause_ctrl(execution_logger)
@@ -3465,16 +3489,39 @@ def run_execute(
                 _shared_context = None
                 _shared_pw_instance = None
 
-            # Fallback: storageState session (used when shared_page is None).
-            if _shared_page is None:
+            # storageState session: required when multiple parallel workers are active
+            # (each worker needs its own browser/context and cannot share a single Page).
+            # When the shared context is already logged in, extract its storageState
+            # directly — no second login needed.  Only fall back to create_wp_session_state
+            # (which does a fresh login) when the shared session itself failed.
+            # Always extract storageState when Playwright is active: multi-worker runs need
+            # it so each worker can build its own context without a second login, and the
+            # extraction is free when _shared_context already exists (no extra browser/login).
+            _needs_session_path = True
+            if _needs_session_path:
                 try:
-                    _wp_session_path = create_wp_session_state(site)
-                    if _wp_session_path:
-                        logger.info("Shared WP session state ready at %s", _wp_session_path)
-                    else:
-                        logger.warning(
-                            "Pre-run WP login failed; each Playwright worker will log in independently"
+                    if _shared_context is not None and _shared_loop is not None:
+                        # Extract cookies/localStorage from the already-authenticated context.
+                        import tempfile as _tempfile
+                        _fd, _sp = _tempfile.mkstemp(suffix=".json", prefix="wp_session_")
+                        os.close(_fd)
+                        _shared_loop.run_until_complete(
+                            _shared_context.storage_state(path=_sp)
                         )
+                        _wp_session_path = _sp
+                        logger.info(
+                            "WP session state extracted from shared context (no second login): %s",
+                            _wp_session_path,
+                        )
+                    else:
+                        # Shared session failed — do a fresh login to build the state file.
+                        _wp_session_path = create_wp_session_state(site)
+                        if _wp_session_path:
+                            logger.info("Shared WP session state ready at %s", _wp_session_path)
+                        else:
+                            logger.warning(
+                                "Pre-run WP login failed; each Playwright worker will log in independently"
+                            )
                 except Exception as _pre_err:
                     logger.warning(
                         "Pre-run WP session creation raised %s; workers will log in independently",

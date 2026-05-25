@@ -1458,7 +1458,6 @@ class WordPressPlaywright:
                 _playwright_log_details(edit_url, job_context),
             )
             await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
-            await page.wait_for_timeout(500)
             try:
                 await page.wait_for_selector(
                     "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
@@ -1467,7 +1466,6 @@ class WordPressPlaywright:
                 )
             except Exception:
                 pass
-            await page.wait_for_timeout(800)
         else:
             if not page_slug:
                 return ("", {"status": "failed", "error": "No post_id and no URL path segment"})
@@ -1489,7 +1487,6 @@ class WordPressPlaywright:
             except Exception:
                 pass
             await page_link.click(timeout=10000)
-            await page.wait_for_timeout(800)
             try:
                 await page.wait_for_selector(
                     "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
@@ -1498,7 +1495,6 @@ class WordPressPlaywright:
                 )
             except Exception:
                 pass
-            await page.wait_for_timeout(800)
 
         self.logger.add_log(
             editor_loaded_log,
@@ -1554,8 +1550,6 @@ class WordPressPlaywright:
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
-
-            await page.wait_for_timeout(600)
 
             self.logger.add_log(
                 "✅ Meta description complete",
@@ -1625,8 +1619,6 @@ class WordPressPlaywright:
 
             if not await self._click_save_post_editor(page):
                 self.logger.add_log("⚠️ Could not click save", "warning", "")
-
-            await page.wait_for_timeout(600)
 
             self.logger.add_log(
                 "✅ SEO title complete",
