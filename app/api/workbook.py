@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Annotated, Any
 
@@ -36,13 +37,19 @@ router = APIRouter(prefix="/api/workbook", tags=["workbook"])
 _DEFAULT_MAX_BYTES = 20 * 1024 * 1024
 
 
+def _header_rows_from_mappings(mappings: list[SheetMapping]) -> dict[str, int]:
+    """Build {sheet_name: skip_header_rows} for enabled mappings."""
+    return {m.sheet_name: m.skip_header_rows for m in mappings if m.enabled}
+
+
 async def _download_workbook_full_for_mappings(
     url: str, mappings: list[SheetMapping]
 ) -> tuple[str, dict[str, Any]]:
     """Download spreadsheet and read full data for the sheets referenced by mappings."""
     body, filename = await download_spreadsheet_from_url(str(url))
     wanted = sorted({m.sheet_name for m in mappings if m.enabled})
-    full = read_full_sheets(body, filename, sheet_names=wanted or None)
+    header_rows = _header_rows_from_mappings(mappings)
+    full = read_full_sheets(body, filename, sheet_names=wanted or None, header_rows=header_rows)
     return filename, full
 
 
@@ -77,8 +84,9 @@ def _decorate_with_suggestions(sheet: SheetPreview, manager: Any = None) -> Shee
                         break
             # Key-alias matching misses short headers like "H1" for current_h1; merge static guesses.
             if schema.id in ACTION_FIELDS:
+                col_set = set(sheet.columns)
                 for k, v in guess_column_map(schema.id, sheet.columns).items():
-                    if k not in col_map and v:
+                    if k not in col_map and v and v in col_set:
                         col_map[k] = v
             sheet.suggested_column_map = col_map
             return sheet
@@ -100,6 +108,7 @@ async def analyze_workbook(
     ],
     site_url: Annotated[str | None, Form()] = None,
     preview_rows: Annotated[int, Form()] = 10,
+    header_rows: Annotated[str | None, Form()] = None,
     request: Request = None,
 ) -> WorkbookAnalyzeResponse:
     if not file.filename:
@@ -125,8 +134,17 @@ async def analyze_workbook(
     if pr > 100:
         pr = 100
 
+    parsed_header_rows: dict[str, int] | None = None
+    if header_rows:
+        try:
+            raw = json.loads(header_rows)
+            if isinstance(raw, dict):
+                parsed_header_rows = {str(k): int(v) for k, v in raw.items() if isinstance(v, (int, float))}
+        except Exception:
+            pass
+
     try:
-        sheets_raw, _ = analyze_spreadsheet_bytes(body, file.filename, preview_rows=pr)
+        sheets_raw, _ = analyze_spreadsheet_bytes(body, file.filename, preview_rows=pr, header_rows=parsed_header_rows)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -218,6 +236,58 @@ async def normalize_mapping_url(payload: MappingNormalizeUrlRequest) -> MappingN
         sheet_rows,
         filename=filename,
         site_url=cleaned_site,
+    )
+
+
+@router.post("/mapping/validate/upload", response_model=MappingValidateResponse)
+async def validate_mapping_upload(
+    file: Annotated[UploadFile, File()],
+    mappings: Annotated[str, Form()],
+    site_url: Annotated[str | None, Form()] = None,
+) -> MappingValidateResponse:
+    body = await file.read()
+    try:
+        mapping_list = [SheetMapping(**m) for m in json.loads(mappings)]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid mappings payload: {e}") from e
+    wanted = sorted({m.sheet_name for m in mapping_list if m.enabled})
+    header_rows = _header_rows_from_mappings(mapping_list)
+    try:
+        full = read_full_sheets(body, file.filename or "upload", sheet_names=wanted or None, header_rows=header_rows)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Could not read uploaded file.") from e
+    sheet_columns = {name: data["columns"] for name, data in full.items()}
+    sheet_rows = {name: data["rows"] for name, data in full.items()}
+    cleaned_site = (site_url or "").strip() or None
+    return validate_mapping(
+        mapping_list, sheet_columns, sheet_rows,
+        filename=file.filename or "upload", site_url=cleaned_site,
+    )
+
+
+@router.post("/mapping/normalize/upload", response_model=MappingNormalizeResponse)
+async def normalize_mapping_upload(
+    file: Annotated[UploadFile, File()],
+    mappings: Annotated[str, Form()],
+    site_url: Annotated[str | None, Form()] = None,
+) -> MappingNormalizeResponse:
+    body = await file.read()
+    try:
+        mapping_list = [SheetMapping(**m) for m in json.loads(mappings)]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid mappings payload: {e}") from e
+    wanted = sorted({m.sheet_name for m in mapping_list if m.enabled})
+    header_rows = _header_rows_from_mappings(mapping_list)
+    try:
+        full = read_full_sheets(body, file.filename or "upload", sheet_names=wanted or None, header_rows=header_rows)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Could not read uploaded file.") from e
+    sheet_columns = {name: data["columns"] for name, data in full.items()}
+    sheet_rows = {name: data["rows"] for name, data in full.items()}
+    cleaned_site = (site_url or "").strip() or None
+    return normalize_mapping(
+        mapping_list, sheet_columns, sheet_rows,
+        filename=file.filename or "upload", site_url=cleaned_site,
     )
 
 

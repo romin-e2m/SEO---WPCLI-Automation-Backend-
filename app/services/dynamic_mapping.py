@@ -6,34 +6,44 @@ from app.schemas.schema import ActionSchema
 from app.schemas.workbook import SheetMapping, SheetMappingError, SheetSummary
 from app.services.mapping_common import (
     coerce_str as _coerce_str,
+    prune_invalid_column_mappings,
     resolve_source_value as _resolve_mapped_cell,
     validate_row_fields,
 )
 
 
+def _norm_header(s: str) -> str:
+    return " ".join(str(s or "").strip().lower().split())
+
+
 def _validate_static(mapping: SheetMapping, available_columns: list[str], schema: ActionSchema) -> list[str]:
     """Static checks against column mapping without inspecting data."""
     issues: list[str] = []
-    
-    col_set = {c.lower(): c for c in available_columns}
-    
-    for canonical, source_col in mapping.column_map.items():
+
+    required_keys = [f.key for f in schema.fields if f.required]
+    column_map = prune_invalid_column_mappings(
+        mapping.column_map,
+        available_columns,
+        required_field_keys=required_keys,
+        normalize=_norm_header,
+    )
+
+    col_set = {_norm_header(c): c for c in available_columns}
+
+    for canonical, source_col in column_map.items():
         if not source_col:
             continue
-        if source_col.lower() not in col_set:
+        if _norm_header(source_col) not in col_set:
             issues.append(
                 f"Column '{source_col}' (mapped to {canonical}) is not in the sheet headers."
             )
-    
-    # Check required fields
-    required_keys = [f.key for f in schema.fields if f.required]
+
     for k in required_keys:
-        if not mapping.column_map.get(k):
+        if not column_map.get(k):
             issues.append(f"Required field '{k}' is not mapped.")
-    
-    # Check any_of groups
+
     for group in schema.any_of_groups:
-        if group.fields and not any(mapping.column_map.get(k) for k in group.fields):
+        if group.fields and not any(column_map.get(k) for k in group.fields):
             pretty = " / ".join(group.fields)
             issues.append(f"At least one of [{pretty}] must be mapped.")
     
@@ -122,11 +132,8 @@ def validate_mapping_dynamic(
                 )
             )
         
-        # Row-level validation
-        rows = sheet_rows.get(m.sheet_name, [])
-        skip_n = m.skip_header_rows
-        extra_skip = max(0, skip_n - 1)
-        data_rows = rows[extra_skip:]
+        # header rows already excluded by read_full_sheets
+        data_rows = sheet_rows.get(m.sheet_name, [])
         
         rows_total = 0
         rows_valid = 0
@@ -210,9 +217,8 @@ def normalize_mapping_dynamic(
             continue
         
         cols = sheet_columns.get(m.sheet_name, [])
-        rows = sheet_rows.get(m.sheet_name, [])
-        extra_skip = max(0, m.skip_header_rows - 1)
-        data_rows = rows[extra_skip:]
+        # header rows already excluded by read_full_sheets
+        data_rows = sheet_rows.get(m.sheet_name, [])
         
         if m.action_type not in grouped:
             grouped[m.action_type] = []

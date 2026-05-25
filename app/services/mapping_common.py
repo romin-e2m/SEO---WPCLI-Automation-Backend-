@@ -26,6 +26,28 @@ def looks_like_url(v: str) -> bool:
     return bool(_URL_START_RE.match(v))
 
 
+def prune_invalid_column_mappings(
+    column_map: dict[str, str],
+    available_columns: list[str],
+    *,
+    required_field_keys: Iterable[str],
+    normalize: Callable[[str], str],
+) -> dict[str, str]:
+    """Drop mappings to columns that are not in the sheet, except keep required keys for validation errors."""
+    col_set = {normalize(c) for c in available_columns}
+    required = set(required_field_keys)
+    out: dict[str, str] = {}
+    for canonical, source_col in column_map.items():
+        if not source_col or not str(source_col).strip():
+            continue
+        if normalize(str(source_col)) in col_set:
+            out[canonical] = source_col
+            continue
+        if canonical in required:
+            out[canonical] = source_col
+    return out
+
+
 def resolve_source_value(
     source_col: str,
     row: dict[str, Any],

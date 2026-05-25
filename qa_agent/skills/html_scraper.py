@@ -79,6 +79,14 @@ async def fetch_page_data(url: str) -> PageData:
     return page
 
 
+def is_empty_html_body(html_content: str | None) -> bool:
+    """True when HTML has no visible text (empty post content)."""
+    if not html_content or not html_content.strip():
+        return True
+    soup = BeautifulSoup(html_content, "html.parser")
+    return not bool(soup.get_text(strip=True))
+
+
 def extract_h1_from_html(html_content: str) -> str | None:
     """
     Extract the first <h1> text from an HTML string (e.g. from WP REST rendered content).

@@ -317,7 +317,7 @@ async def stream_execution_logs(execution_id: str):
 
 @router.get("/export/{execution_id}")
 def export_results(execution_id: str):
-    """Download an Excel file with all original row data and a trailing Status column."""
+    """Download Excel with original columns plus Automation Status and QA Status."""
     execution = get_execution_logger(execution_id)
     if not execution:
         raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
@@ -332,7 +332,8 @@ def export_results(execution_id: str):
         raise HTTPException(status_code=422, detail=f"Stored payload invalid: {str(e)}") from e
 
     row_results = execution.get_row_results()
-    excel_bytes = build_export_excel(body.grouped, row_results)
+    qa_report = execution.get_qa_report()
+    excel_bytes = build_export_excel(body.grouped, row_results, qa_report=qa_report)
 
     short_id = execution_id[:8]
     filename = f"seo_results_{short_id}.xlsx"

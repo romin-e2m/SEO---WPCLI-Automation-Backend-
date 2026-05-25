@@ -152,11 +152,12 @@ def _is_probably_xls(content: bytes) -> bool:
     return len(content) >= 8 and content[:8] == _XLS_MAGIC
 
 
-def _all_sheet_row_counts_xlsx(content: bytes) -> dict[str, int]:
-    """Count *data* rows (excluding the header row) per sheet.
+def _all_sheet_row_counts_xlsx(content: bytes, header_rows: dict[str, int] | None = None) -> dict[str, int]:
+    """Count *data* rows (excluding header rows) per sheet.
 
     openpyxl's read_only mode does not always compute max_row reliably,
     so we open in normal mode (workbooks are size-capped upstream).
+    header_rows maps sheet name -> number of header rows to subtract (default 1).
     """
     bio = io.BytesIO(content)
     wb = load_workbook(bio, read_only=False, data_only=True)
@@ -166,8 +167,8 @@ def _all_sheet_row_counts_xlsx(content: bytes) -> dict[str, int]:
             ws = wb[name]
             mr = ws.max_row
             total = int(mr) if mr is not None else 0
-            # Subtract the header row to align with the analyzed dataframe shape.
-            counts[name] = max(0, total - 1)
+            skip = (header_rows or {}).get(name, 1)
+            counts[name] = max(0, total - skip)
         return counts
     finally:
         wb.close()
@@ -244,12 +245,13 @@ def _analyze_xlsx_bytes(
     content: bytes,
     *,
     preview_rows: int,
+    header_rows: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not _is_probably_xlsx(content):
         raise ValueError("File is not a valid .xlsx (Office Open XML) workbook.")
 
     try:
-        row_counts = _all_sheet_row_counts_xlsx(content)
+        row_counts = _all_sheet_row_counts_xlsx(content, header_rows=header_rows)
     except Exception:
         row_counts = {}
 
@@ -260,10 +262,14 @@ def _analyze_xlsx_bytes(
         out: list[dict[str, Any]] = []
 
         for name in sheet_names:
+            # skip_count is total header rows for this sheet (title row + real header row, etc.)
+            # pandas header= index is 0-based, so we use skip_count - 1.
+            skip_count = (header_rows or {}).get(name, 1)
+            header_idx = max(0, skip_count - 1)
             df = pd.read_excel(
                 xl,
                 sheet_name=name,
-                header=0,
+                header=header_idx,
                 dtype=object,
                 nrows=preview_rows,
             )
@@ -287,6 +293,7 @@ def _analyze_xls_bytes(
     content: bytes,
     *,
     preview_rows: int,
+    header_rows: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not _is_probably_xls(content):
         raise ValueError("File is not a valid .xls (Excel 97-2003) workbook.")
@@ -312,12 +319,15 @@ def _analyze_xls_bytes(
             )
             continue
 
-        raw_headers = [sh.cell_value(0, c) for c in range(ncol)]
+        skip_count = (header_rows or {}).get(name, 1)
+        header_row_idx = max(0, skip_count - 1)
+        raw_headers = [sh.cell_value(header_row_idx, c) for c in range(ncol)]
         columns = _xls_unique_columns(raw_headers)
 
-        data_rows_upper = min(nrows - 1, preview_rows)
+        data_start = header_row_idx + 1
+        data_rows_upper = min(nrows - data_start, preview_rows)
         rows_out: list[dict[str, Any]] = []
-        for r in range(1, 1 + data_rows_upper):
+        for r in range(data_start, data_start + data_rows_upper):
             record: dict[str, Any] = {}
             for c, col in enumerate(columns):
                 if c >= ncol:
@@ -331,7 +341,7 @@ def _analyze_xls_bytes(
             {
                 "name": name,
                 "columns": columns,
-                "row_count": nrows,
+                "row_count": max(0, nrows - skip_count),
                 "preview_row_count": len(rows_out),
                 "rows": rows_out,
             }
@@ -409,6 +419,7 @@ def analyze_spreadsheet_bytes(
     filename: str,
     *,
     preview_rows: int,
+    header_rows: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not content:
         raise ValueError("Empty file.")
@@ -418,9 +429,9 @@ def analyze_spreadsheet_bytes(
         label = PurePath(filename).stem.strip() or "CSV"
         return _analyze_csv_bytes(content, preview_rows=preview_rows, sheet_name=label)
     if suffix == ".xls":
-        return _analyze_xls_bytes(content, preview_rows=preview_rows)
+        return _analyze_xls_bytes(content, preview_rows=preview_rows, header_rows=header_rows)
     if suffix == ".xlsx":
-        return _analyze_xlsx_bytes(content, preview_rows=preview_rows)
+        return _analyze_xlsx_bytes(content, preview_rows=preview_rows, header_rows=header_rows)
 
     raise ValueError(f"Unsupported file type {suffix or '(none)'}. Use .xlsx, .xls, or .csv.")
 
@@ -439,6 +450,7 @@ def _max_full_rows() -> int:
 def _read_full_xlsx_sheets(
     content: bytes,
     sheet_names: list[str] | None,
+    header_rows: dict[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not _is_probably_xlsx(content):
         raise ValueError("File is not a valid .xlsx (Office Open XML) workbook.")
@@ -451,10 +463,12 @@ def _read_full_xlsx_sheets(
         max_rows = _max_full_rows()
         out: dict[str, dict[str, Any]] = {}
         for name in targets:
+            skip_count = (header_rows or {}).get(name, 1)
+            header_idx = max(0, skip_count - 1)
             df = pd.read_excel(
                 xl,
                 sheet_name=name,
-                header=0,
+                header=header_idx,
                 dtype=object,
                 nrows=max_rows,
             )
@@ -475,6 +489,7 @@ def _read_full_xlsx_sheets(
 def _read_full_xls_sheets(
     content: bytes,
     sheet_names: list[str] | None,
+    header_rows: dict[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not _is_probably_xls(content):
         raise ValueError("File is not a valid .xls (Excel 97-2003) workbook.")
@@ -493,12 +508,15 @@ def _read_full_xls_sheets(
             out[name] = {"columns": [], "rows": []}
             continue
 
-        raw_headers = [sh.cell_value(0, c) for c in range(ncol)]
+        skip_count = (header_rows or {}).get(name, 1)
+        header_row_idx = max(0, skip_count - 1)
+        raw_headers = [sh.cell_value(header_row_idx, c) for c in range(ncol)]
         columns = _xls_unique_columns(raw_headers)
 
-        upper = min(nrows - 1, max_rows)
+        data_start = header_row_idx + 1
+        upper = min(nrows - data_start, max_rows)
         rows_out: list[dict[str, Any]] = []
-        for r in range(1, 1 + upper):
+        for r in range(data_start, data_start + upper):
             rec: dict[str, Any] = {}
             for c, col in enumerate(columns):
                 if c >= ncol:
@@ -561,11 +579,13 @@ def read_full_sheets(
     content: bytes,
     filename: str,
     sheet_names: list[str] | None = None,
+    header_rows: dict[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return {sheet_name: {columns: [...], rows: [{...}, ...]}} for the requested sheets.
 
     Used by the mapping validate/normalize endpoints to evaluate the user's column choices
     against actual data, not just the preview.
+    header_rows maps sheet name -> total header rows to skip (title + column header rows combined).
     """
     if not content:
         raise ValueError("Empty file.")
@@ -575,8 +595,8 @@ def read_full_sheets(
         label = PurePath(filename).stem.strip() or "CSV"
         return _read_full_csv_sheets(content, label)
     if suffix == ".xls":
-        return _read_full_xls_sheets(content, sheet_names)
+        return _read_full_xls_sheets(content, sheet_names, header_rows=header_rows)
     if suffix == ".xlsx":
-        return _read_full_xlsx_sheets(content, sheet_names)
+        return _read_full_xlsx_sheets(content, sheet_names, header_rows=header_rows)
 
     raise ValueError(f"Unsupported file type {suffix or '(none)'}. Use .xlsx, .xls, or .csv.")

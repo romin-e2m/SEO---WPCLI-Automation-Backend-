@@ -905,6 +905,13 @@ class WpRestClient:
         }
 
     @staticmethod
+    def is_effectively_empty_post_content(html: str | None) -> bool:
+        """True when post body has no visible text (empty or builder-only pages)."""
+        if not html or not str(html).strip():
+            return True
+        return not bool(strip_html_tags(html).strip())
+
+    @staticmethod
     def first_h1_inner_text(html: str | None) -> str | None:
         if not html:
             return None

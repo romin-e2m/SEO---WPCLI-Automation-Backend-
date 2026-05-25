@@ -7,6 +7,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 from typing import Any
 
+from app.services.execution_log_registry import get as get_execution_logger
+
 router = APIRouter(prefix="/api/qa", tags=["qa"])
 
 # qa_agent/ is copied to /qa_agent inside the container (see Dockerfile).
@@ -41,4 +43,10 @@ async def run_qa_check(body: QARunRequest) -> dict:
         username=body.username,
         app_password=body.app_password,
     )
-    return report.model_dump()
+    dumped = report.model_dump()
+    execution_id = body.execute_response.get("execution_id")
+    if execution_id:
+        execution = get_execution_logger(str(execution_id))
+        if execution is not None:
+            execution.store_qa_report(dumped)
+    return dumped

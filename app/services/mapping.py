@@ -15,6 +15,7 @@ from app.schemas.workbook import (
 from app.services.mapping_common import (
     coerce_str as _coerce_str,
     looks_like_url as _looks_like_url,
+    prune_invalid_column_mappings,
     resolve_source_value as _resolve_mapped_cell,
     validate_row_fields,
 )
@@ -42,10 +43,12 @@ HEADER_ALIASES: dict[str, list[str]] = {
     ],
     "recommended_h1": [
         "recommended h1",
+        "suggested h1",
         "new h1",
         "proposed h1",
         "h1 (new)",
         "recommended heading",
+        "suggested heading",
         "new heading",
         "proposed heading",
     ],
@@ -155,8 +158,15 @@ def guess_column_map(action_type: ActionType, columns: list[str]) -> dict[str, s
     exclusions: dict[str, set[str]] = {
         "current_meta_description": {"h1", "heading", "title"},
         "recommended_meta_description": {"h1", "heading", "title"},
-        "current_h1": {"description", "meta", "description"},
-        "recommended_h1": {"description", "meta"},
+        "current_h1": {
+            "description",
+            "meta",
+            "suggested",
+            "recommended",
+            "proposed",
+            "new",
+        },
+        "recommended_h1": {"description", "meta", "current"},
     }
     
     for f in spec["fields"]:
@@ -246,8 +256,16 @@ def _validate_static(mapping: SheetMapping, available_columns: list[str]) -> lis
         issues.append(f"Unknown action_type '{mapping.action_type}'.")
         return issues
 
+    required_keys = [f["key"] for f in spec["fields"] if f["required"]]
+    column_map = prune_invalid_column_mappings(
+        mapping.column_map,
+        available_columns,
+        required_field_keys=required_keys,
+        normalize=_norm_header,
+    )
+
     col_set = {_norm_header(c): c for c in available_columns}
-    for canonical, source_col in mapping.column_map.items():
+    for canonical, source_col in column_map.items():
         if not source_col:
             continue
         if _norm_header(source_col) not in col_set:
@@ -255,13 +273,12 @@ def _validate_static(mapping: SheetMapping, available_columns: list[str]) -> lis
                 f"Column '{source_col}' (mapped to {canonical}) is not in the sheet headers."
             )
 
-    required_keys = [f["key"] for f in spec["fields"] if f["required"]]
     for k in required_keys:
-        if not mapping.column_map.get(k):
+        if not column_map.get(k):
             issues.append(f"Required field '{k}' is not mapped.")
 
     for group in spec.get("any_of_groups", []):
-        if group and not any(mapping.column_map.get(k) for k in group):
+        if group and not any(column_map.get(k) for k in group):
             pretty = " / ".join(group)
             issues.append(f"At least one of [{pretty}] must be mapped.")
 
@@ -332,12 +349,10 @@ def validate_mapping(
             )
 
         # row-level summary (cheap)
+        # header rows are already excluded by read_full_sheets using skip_header_rows,
+        # so all rows here are data rows.
         rows = sheet_rows.get(m.sheet_name, [])
-        skip_n = m.skip_header_rows
-        # we already excluded the column-header row when reading,
-        # so skip_header_rows beyond 1 means extra banner rows to drop.
-        extra_skip = max(0, skip_n - 1)
-        data_rows = rows[extra_skip:]
+        data_rows = rows
 
         rows_total = 0
         rows_valid = 0
@@ -413,9 +428,8 @@ def normalize_mapping(
         if not m.enabled:
             continue
         cols = sheet_columns.get(m.sheet_name, [])
-        rows = sheet_rows.get(m.sheet_name, [])
-        extra_skip = max(0, m.skip_header_rows - 1)
-        data_rows = rows[extra_skip:]
+        # header rows already excluded by read_full_sheets
+        data_rows = sheet_rows.get(m.sheet_name, [])
 
         for idx, raw in enumerate(data_rows, start=1):
             mapped: dict[str, Any] = {}

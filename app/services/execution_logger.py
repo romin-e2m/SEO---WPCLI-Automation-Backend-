@@ -35,6 +35,8 @@ class ExecutionLogger:
         self._rows_completed: int = 0
         # Structured per-row results for live table rendering on the frontend.
         self._row_results: list[dict[str, Any]] = []
+        # Last QA report dict (set after POST /api/qa/run) for Excel export.
+        self._qa_report: Optional[dict[str, Any]] = None
         # Optional PauseController callback for action-level pause (set by caller)
         self._on_pause_callback: Optional[Callable[[], None]] = None
         self._on_resume_callback: Optional[Callable[[], None]] = None
@@ -124,6 +126,10 @@ class ExecutionLogger:
         with self._lock:
             return self._payload
 
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     def log_sync(
         self,
         action: str,
@@ -135,7 +141,7 @@ class ExecutionLogger:
             self._log_counter += 1
             entry = ExecutionLogEntry(
                 id=f"log_{self.execution_id}_{self._log_counter}",
-                timestamp=datetime.now(timezone.utc).isoformat() + "Z",
+                timestamp=self._utc_timestamp(),
                 action=action,
                 status=status,
                 details=details,
@@ -149,9 +155,12 @@ class ExecutionLogger:
             self._log_counter += 1
             raw_id = log_entry.get("id")
             entry_id = raw_id if raw_id else f"log_{self.execution_id}_{self._log_counter}"
+            ts = log_entry.get("timestamp")
+            if not isinstance(ts, str):
+                ts = self._utc_timestamp()
             entry = ExecutionLogEntry(
                 id=entry_id,
-                timestamp=log_entry["timestamp"],
+                timestamp=ts,
                 action=log_entry["action"],
                 status=log_entry["status"],
                 details=log_entry.get("details"),
@@ -169,6 +178,14 @@ class ExecutionLogger:
         with self._lock:
             return list(self._row_results)
 
+    def store_qa_report(self, report: dict[str, Any]) -> None:
+        with self._lock:
+            self._qa_report = report
+
+    def get_qa_report(self) -> Optional[dict[str, Any]]:
+        with self._lock:
+            return self._qa_report
+
     def clear(self) -> None:
         """Reset logs (e.g. before a new dry-run or execute)."""
         with self._lock:
@@ -178,6 +195,7 @@ class ExecutionLogger:
             self._paused = False
             self._rows_completed = 0
             self._row_results = []
+            self._qa_report = None
 
     def get_logs(self) -> list[dict]:
         """Get all logs so far."""

@@ -5,12 +5,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from app.services.execution_log_registry import append_log_entry
+from app.services.execution_log_registry import append_log_entry, get as get_execution_logger
 from app.services.monitor_context import current_monitor_execution_id
 
 
 def _emit(action: str, status: str, details: str | None) -> None:
+    """Single monitor log line — uses registered ExecutionLogger when present."""
     execution_id = current_monitor_execution_id.get()
+    registered = get_execution_logger(execution_id)
+    if registered is not None:
+        registered.log_sync(action, status, details)
+        return
     append_log_entry(
         execution_id,
         {

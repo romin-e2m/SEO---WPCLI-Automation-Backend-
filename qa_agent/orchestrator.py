@@ -65,10 +65,14 @@ async def run_qa(
     # Include updated and skipped rows — both represent a final WordPress state worth verifying
     rows_to_verify = [r for r in all_rows if r.outcome in ("updated", "skipped")]
 
-    # Exclude skipped image rows — they have no attachment_id/media_id so cannot be verified
+    # Exclude rows that cannot or should not be verified
     def should_verify(row: ExecuteRowResult) -> bool:
         if row.action_type == "images" and row.outcome == "skipped":
             return False
+        if row.action_type == "on_page" and row.outcome == "skipped":
+            fields = (row.detail or {}).get("fields_updated") or []
+            if "h1" not in fields:
+                return False
         return True
 
     rows_to_verify = [r for r in rows_to_verify if should_verify(r)]

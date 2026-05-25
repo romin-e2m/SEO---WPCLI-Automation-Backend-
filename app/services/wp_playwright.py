@@ -339,6 +339,14 @@ class PlaywrightLogger:
         self.screenshots.clear()
 
 
+def _playwright_log_details(details: str, job_context: str | None) -> str:
+    if not job_context:
+        return details
+    if details:
+        return f"{job_context} — {details}"
+    return job_context
+
+
 class WordPressPlaywright:
     """
     Automates WordPress admin panel operations using Playwright.
@@ -446,6 +454,18 @@ class WordPressPlaywright:
             self.logger.add_log("❌ Login failed", "error", "Could not reach wp-admin")
         return False
     
+    async def verify_session(self, page: Page) -> bool:
+        """Navigate to wp-admin and confirm the storageState session is still valid (not redirected to login)."""
+        try:
+            await page.goto(self.admin_url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_url("**/wp-admin/**", timeout=5000)
+            current = page.url
+            if "wp-login" in current or "action=login" in current:
+                return False
+            return True
+        except Exception:
+            return False
+
     async def _close_popup_if_exists(self, page: Page) -> None:
         """
         Safely close any popups or modals that might appear on the page.
@@ -852,7 +872,7 @@ class WordPressPlaywright:
             hdr = box.locator(".postbox-header, .hndle").first
             if await hdr.count() > 0:
                 await hdr.click(timeout=4000, force=True)
-                await page.wait_for_timeout(350)
+                await page.wait_for_timeout(600)
         except Exception:
             pass
 
@@ -1044,7 +1064,7 @@ class WordPressPlaywright:
 
         try:
             await page.locator("#yoast-google-preview-description-metabox").first.wait_for(
-                state="attached", timeout=15000
+                state="visible", timeout=15000
             )
         except Exception:
             pass
@@ -1190,7 +1210,7 @@ class WordPressPlaywright:
 
         try:
             await page.locator("#yoast-google-preview-title-metabox").first.wait_for(
-                state="attached", timeout=15000
+                state="visible", timeout=15000
             )
         except Exception:
             pass
@@ -1412,33 +1432,42 @@ class WordPressPlaywright:
         shot_prefix_not_found: str,
         shot_prefix_editor: str,
         editor_loaded_log: str,
+        job_context: str | None = None,
     ) -> tuple[str, dict[str, Any] | None]:
         """Open editor with proper Yoast load detection."""
         nav_ms = 30000 if light_mode else 45000
         page.set_default_timeout(nav_ms)
 
-        self.logger.add_log(start_log_message, "info", "")
+        self.logger.add_log(start_log_message, "info", _playwright_log_details("", job_context))
 
         parsed = urlparse(page_url)
         page_path = parsed.path.strip("/")
         page_slug = page_path.split("/")[-1] if page_path else ""
 
-        self.logger.add_log("🔍 Resolved", "info", f"slug={page_slug!r}")
+        self.logger.add_log(
+            "🔍 Resolved",
+            "info",
+            _playwright_log_details(f"slug={page_slug!r}", job_context),
+        )
 
         if post_id is not None:
             edit_url = urljoin(self.admin_url, f"post.php?post={int(post_id)}&action=edit")
-            self.logger.add_log("🌐 Opening editor", "info", edit_url)
+            self.logger.add_log(
+                "🌐 Opening editor",
+                "info",
+                _playwright_log_details(edit_url, job_context),
+            )
             await page.goto(edit_url, wait_until="domcontentloaded", timeout=nav_ms)
             await page.wait_for_timeout(500)
             try:
                 await page.wait_for_selector(
                     "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
-                    state="attached",
+                    state="visible",
                     timeout=15000,
                 )
             except Exception:
                 pass
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(800)
         else:
             if not page_slug:
                 return ("", {"status": "failed", "error": "No post_id and no URL path segment"})
@@ -1450,7 +1479,11 @@ class WordPressPlaywright:
             if page_link is None:
                 return ("", {"status": "failed", "error": f"Content not found for slug '{page_slug}'"})
 
-            self.logger.add_log("✅ Matched; opening editor", "success", page_slug)
+            self.logger.add_log(
+                "✅ Matched; opening editor",
+                "success",
+                _playwright_log_details(page_slug, job_context),
+            )
             try:
                 await self._safe_scroll_into_view(page, page_link, timeout_ms=2000)
             except Exception:
@@ -1460,14 +1493,18 @@ class WordPressPlaywright:
             try:
                 await page.wait_for_selector(
                     "#wpseo_meta, .edit-post-layout__metaboxes, #yoast-google-preview-description-metabox",
-                    state="attached",
+                    state="visible",
                     timeout=15000,
                 )
             except Exception:
                 pass
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(800)
 
-        self.logger.add_log(editor_loaded_log, "success", "")
+        self.logger.add_log(
+            editor_loaded_log,
+            "success",
+            _playwright_log_details("", job_context),
+        )
         return (page_slug, None)
 
     async def update_meta_description(
@@ -1478,6 +1515,7 @@ class WordPressPlaywright:
         post_id: int | None = None,
         *,
         light_mode: bool = False,
+        job_context: str | None = None,
     ) -> dict[str, Any]:
         """Update SEO meta description with light mode enabled for speed."""
         try:
@@ -1494,6 +1532,7 @@ class WordPressPlaywright:
                 shot_prefix_not_found="page_not_found",
                 shot_prefix_editor="08_page_editor",
                 editor_loaded_log="✅ Editor ready",
+                job_context=job_context,
             )
             if prep_err:
                 return prep_err
@@ -1518,7 +1557,11 @@ class WordPressPlaywright:
 
             await page.wait_for_timeout(600)
 
-            self.logger.add_log("✅ Meta description complete", "success", page_slug or str(post_id))
+            self.logger.add_log(
+                "✅ Meta description complete",
+                "success",
+                _playwright_log_details(page_slug or str(post_id), job_context),
+            )
 
             return {
                 "status": "updated",
@@ -1528,7 +1571,11 @@ class WordPressPlaywright:
             }
 
         except Exception as e:
-            self.logger.add_log("❌ Meta update failed", "error", str(e)[:60])
+            self.logger.add_log(
+                "❌ Meta update failed",
+                "error",
+                _playwright_log_details(str(e)[:60], job_context),
+            )
             logger.error(f"Failed to update meta description: {e}")
             return {"status": "failed", "error": str(e)}
 
@@ -1540,6 +1587,7 @@ class WordPressPlaywright:
         post_id: int | None = None,
         *,
         light_mode: bool = False,
+        job_context: str | None = None,
     ) -> dict[str, Any]:
         """Update SEO title with light mode enabled for speed."""
         try:
@@ -1556,6 +1604,7 @@ class WordPressPlaywright:
                 shot_prefix_not_found="page_not_found_title",
                 shot_prefix_editor="08_page_editor_title",
                 editor_loaded_log="✅ Editor ready",
+                job_context=job_context,
             )
             if prep_err:
                 return prep_err
@@ -1579,7 +1628,11 @@ class WordPressPlaywright:
 
             await page.wait_for_timeout(600)
 
-            self.logger.add_log("✅ SEO title complete", "success", page_slug or str(post_id))
+            self.logger.add_log(
+                "✅ SEO title complete",
+                "success",
+                _playwright_log_details(page_slug or str(post_id), job_context),
+            )
 
             return {
                 "status": "updated",
@@ -1589,6 +1642,10 @@ class WordPressPlaywright:
             }
 
         except Exception as e:
-            self.logger.add_log("❌ SEO title failed", "error", str(e)[:60])
+            self.logger.add_log(
+                "❌ SEO title failed",
+                "error",
+                _playwright_log_details(str(e)[:60], job_context),
+            )
             logger.error(f"Failed to update SEO title: {e}")
             return {"status": "failed", "error": str(e)}
