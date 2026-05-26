@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 import os
+import threading
 
 from app.services.execution_logger import ExecutionLogger
 
 _MAX_TRACKED_EXECUTIONS = int(os.getenv("MAX_TRACKED_EXECUTIONS", "50"))
 
 _executions: dict[str, ExecutionLogger] = {}
+_registry_lock = threading.Lock()
 
 
 def register(execution_id: str, logger: ExecutionLogger) -> None:
     """Store a logger (e.g. from /api/run/execute). Prunes completed entries when over capacity."""
-    if len(_executions) >= _MAX_TRACKED_EXECUTIONS:
-        for eid, ex in list(_executions.items()):
-            if ex.is_complete():
-                _executions.pop(eid, None)
-            if len(_executions) < _MAX_TRACKED_EXECUTIONS:
-                break
-    _executions[execution_id] = logger
+    with _registry_lock:
+        if len(_executions) >= _MAX_TRACKED_EXECUTIONS:
+            for eid, ex in list(_executions.items()):
+                if ex.is_complete():
+                    _executions.pop(eid, None)
+                if len(_executions) < _MAX_TRACKED_EXECUTIONS:
+                    break
+        _executions[execution_id] = logger
 
 
 def get(execution_id: str) -> ExecutionLogger | None:

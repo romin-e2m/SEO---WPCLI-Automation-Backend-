@@ -2605,6 +2605,20 @@ def run_dry_run(
                 f"Resuming from row {i} of {len(rows_iter)}")
 
         while i < len(rows_iter):
+            # Pre-row pause check — responds to pause BEFORE starting the next row
+            if execution_logger is not None and execution_logger.is_paused():
+                execution_logger.log_sync("dry_run_paused", "warning", f"Paused before row {i+1} of {len(rows_iter)}")
+                execution_logger.mark_complete()
+                return DryRunResponse(
+                    rows_processed=len(rows_out),
+                    ready_to_execute=sum(1 for r in rows_out if r.outcome == "change"),
+                    blocked=sum(1 for r in rows_out if r.outcome == "blocked"),
+                    errors=sum(1 for r in rows_out if r.outcome == "error"),
+                    no_change=sum(1 for r in rows_out if r.outcome == "no_change"),
+                    rows=rows_out,
+                    paused=True,
+                    rows_completed=i,
+                )
             action, row = rows_iter[i]
             try:
                 if action == "on_page":
@@ -3540,6 +3554,19 @@ def run_execute(
                     f"Resuming from row {i} of {len(rows_iter)}",
                 )
             while i < len(rows_iter):
+                # Pre-row pause check — responds to pause BEFORE starting the next row
+                if execution_logger is not None and execution_logger.is_paused():
+                    execution_logger.log_sync("execute_paused", "warning", f"Paused before row {i+1} of {len(rows_iter)}")
+                    execution_logger.mark_complete()
+                    return ExecuteResponse(
+                        rows_processed=len(rows_out),
+                        updated=sum(1 for r in rows_out if r.outcome == "updated"),
+                        skipped=sum(1 for r in rows_out if r.outcome == "skipped"),
+                        failed=sum(1 for r in rows_out if r.outcome == "failed"),
+                        rows=rows_out,
+                        paused=True,
+                        rows_completed=i,
+                    )
                 action, row = rows_iter[i]
                 try:
                     pw_batch_results: list[ExecuteRowResult] | None = None

@@ -3,7 +3,7 @@ import json
 import asyncio
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.services.execution_log_registry import ensure
@@ -38,7 +38,7 @@ def _sse_status_payload(logger) -> str:
     )
 
 
-async def _stream_generator(execution_id: str):
+async def _stream_generator(execution_id: str, request: Request):
     """Stream execution logs via SSE. Emits a 'status' event when done or paused then closes."""
     yield _sse_log_payload(
         {
@@ -87,10 +87,14 @@ async def _stream_generator(execution_id: str):
     for _ in range(_SSE_MAX_ITERATIONS):
         await asyncio.sleep(_SSE_POLL_INTERVAL_SEC)
 
+        # Check if client disconnected — stop wasting resources
+        if await request.is_disconnected():
+            return
+
         # Flush any new log entries
         logs = logger.get_logs()
         if last_index > len(logs):
-            last_index = 0
+            last_index = len(logs)  # skip cleared section, don't replay
         if len(logs) > last_index:
             for log in logs[last_index:]:
                 yield _sse_log_payload(log)
@@ -99,7 +103,7 @@ async def _stream_generator(execution_id: str):
         # Flush any new row result entries
         row_results = logger.get_row_results()
         if last_row_index > len(row_results):
-            last_row_index = 0
+            last_row_index = len(row_results)  # skip cleared section, don't replay
         if len(row_results) > last_row_index:
             for rr in row_results[last_row_index:]:
                 yield _sse_row_result_payload(rr)
@@ -121,12 +125,12 @@ async def _stream_generator(execution_id: str):
 
 
 @router.get("/execution/stream")
-async def get_execution_stream(execution_id: str = Query("default")):
+async def get_execution_stream(request: Request, execution_id: str = Query("default")):
     """SSE endpoint for live execution logs."""
     ensure(execution_id)
 
     return StreamingResponse(
-        _stream_generator(execution_id),
+        _stream_generator(execution_id, request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

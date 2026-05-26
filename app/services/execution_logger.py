@@ -78,11 +78,12 @@ class ExecutionLogger:
             self._pause_controller = controller
 
     def pause(self) -> None:
+        cb = None
         with self._lock:
             if not self._complete:
                 self._paused = True
                 cb = self._on_pause_callback
-        
+
         # Call outside lock to avoid deadlock
         if cb is not None:
             try:
@@ -92,10 +93,11 @@ class ExecutionLogger:
                 _logging.getLogger(__name__).error(f"Error calling pause callback: {e}")
 
     def resume(self) -> None:
+        cb = None
         with self._lock:
             self._paused = False
             cb = self._on_resume_callback
-        
+
         # Call outside lock to avoid deadlock
         if cb is not None:
             try:
@@ -105,17 +107,16 @@ class ExecutionLogger:
                 _logging.getLogger(__name__).error(f"Error calling resume callback: {e}")
 
     def resume_and_reset_complete(self) -> None:
-        """Clear paused/complete flags and flush stored row results for resume.
+        """Clear paused/complete flags for resume.
 
-        Row results from the first execution half are already in the frontend's
-        rowResults state. Clearing them here prevents the SSE stream from
-        replaying them when the new connection opens, which would double every
-        row in the UI.
+        _row_results are intentionally kept so the SSE stream can replay the
+        full set of row results (both halves) after a page refresh/reconnect.
+        The frontend's onRowResult handler deduplicates by action_type|sheet_name|row_index.
         """
         with self._lock:
             self._paused = False
             self._complete = False
-            self._row_results = []
+            # Do NOT clear _row_results — SSE will replay them; frontend deduplication handles it.
 
     def set_rows_completed(self, n: int) -> None:
         with self._lock:

@@ -681,11 +681,7 @@ class WordPressPlaywright:
             
             await page.goto(redirect_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(500)
-            
-            screenshot_path = f"{SCREENSHOTS_DIR}/04_redirect_page_loaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            await page.screenshot(path=screenshot_path)
-            self.logger.add_screenshot(screenshot_path)
-            
+
             await self._close_popup_if_exists(page)
             
             self.logger.add_log(
@@ -785,16 +781,12 @@ class WordPressPlaywright:
             await page.wait_for_timeout(150)
             await to_field.fill(to_url)
             await page.wait_for_timeout(200)
-            
+
             self.logger.add_log(
                 "✅ 'To' field filled",
                 "success"
             )
-            
-            screenshot_path = f"{SCREENSHOTS_DIR}/05_redirect_form_filled_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            await page.screenshot(path=screenshot_path)
-            self.logger.add_screenshot(screenshot_path)
-            
+
             self.logger.add_log(
                 "🖱️  Clicking Save button",
                 "info",
@@ -810,11 +802,7 @@ class WordPressPlaywright:
             )
             
             await page.wait_for_timeout(800)
-            
-            screenshot_path = f"{SCREENSHOTS_DIR}/06_redirect_saved_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            await page.screenshot(path=screenshot_path)
-            self.logger.add_screenshot(screenshot_path)
-            
+
             self.logger.add_log(
                 "✅ 301 redirect created",
                 "success",
@@ -1167,7 +1155,7 @@ class WordPressPlaywright:
         ]
         for sel in modal_selectors:
             try:
-                await page.wait_for_selector(sel, state="visible", timeout=5000)
+                await page.wait_for_selector(sel, state="visible", timeout=2000)
                 self.logger.add_log("✅ Rank Math snippet editor modal open", "success", "")
                 return True
             except Exception:
@@ -1848,7 +1836,7 @@ class WordPressPlaywright:
         async def _wait_for_seo_panel() -> None:
             for _sel in _seo_ready_selectors:
                 try:
-                    await page.wait_for_selector(_sel, state="visible", timeout=3000)
+                    await page.wait_for_selector(_sel, state="visible", timeout=1500)
                     return
                 except Exception:
                     pass
