@@ -18,7 +18,8 @@ def register(execution_id: str, logger: ExecutionLogger) -> None:
     with _registry_lock:
         if len(_executions) >= _MAX_TRACKED_EXECUTIONS:
             for eid, ex in list(_executions.items()):
-                if ex.is_complete():
+                # Never evict a paused execution — it must survive until resumed or abandoned.
+                if ex.is_complete() and not ex.is_paused():
                     _executions.pop(eid, None)
                 if len(_executions) < _MAX_TRACKED_EXECUTIONS:
                     break

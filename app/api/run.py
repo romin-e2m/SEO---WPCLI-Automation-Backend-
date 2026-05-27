@@ -294,10 +294,15 @@ async def _log_stream_generator(execution_id: str):
         else:
             ticks_since_new += 1
 
-        if execution.is_complete():
+        if execution.is_complete() and not execution.is_paused():
             if n == last_len and ticks_since_new >= 2:
                 summary = execution.get_summary()
-                yield f"data: {json.dumps({'event': 'completed', 'paused': execution.is_paused(), 'summary': summary})}\n\n"
+                yield f"data: {json.dumps({'event': 'completed', 'paused': False, 'summary': summary})}\n\n"
+                return
+        elif execution.is_paused():
+            if n == last_len and ticks_since_new >= 2:
+                summary = execution.get_summary()
+                yield f"data: {json.dumps({'event': 'paused', 'paused': True, 'summary': summary})}\n\n"
                 return
         elif ticks_since_new >= 75:
             yield ": heartbeat\n\n"

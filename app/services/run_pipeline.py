@@ -1943,8 +1943,17 @@ def _chunk_results_from_pw_list(
     pw_list: list[ExecuteRowResult] | None,
     *,
     error_message: str | None = None,
+    was_paused: bool = False,
     execution_logger: ExecutionLogger | None = None,
 ) -> list[tuple[int, ExecuteRowResult]]:
+    """Map a (possibly partial) pw_list back onto the full chunk.
+
+    was_paused=True: rows beyond pw_list length were not attempted because of a
+    pause — they get outcome="skipped" and are NOT published to the SSE stream so
+    the frontend can re-process them on resume.
+
+    error_message: every row in the chunk gets outcome="failed" with this message.
+    """
     if error_message is not None:
         out_err: list[tuple[int, ExecuteRowResult]] = []
         for idx, row, pid, url, new_v, old_v in chunk:
@@ -1966,16 +1975,29 @@ def _chunk_results_from_pw_list(
         if k < len(pw_list):
             out.append((idx, pw_list[k]))
         else:
-            er = ExecuteRowResult(
-                action_type=spec.action_type,
-                sheet_name=row.sheet_name,
-                row_index=row.row_index,
-                outcome="failed",
-                message="Playwright worker stopped early (paused or error).",
-                post_id=pid,
-                detail=_seo_pw_job_detail(spec, url, old_v, new_v),
-            )
-            _publish_execute_row_result(execution_logger, er)
+            if was_paused:
+                # Row was not attempted — do not mark as failed; will be retried on resume.
+                er = ExecuteRowResult(
+                    action_type=spec.action_type,
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="skipped",
+                    message="Not attempted: execution paused before this row.",
+                    post_id=pid,
+                    detail=_seo_pw_job_detail(spec, url, old_v, new_v),
+                )
+                # Do NOT publish to SSE — frontend will see these rows on resume.
+            else:
+                er = ExecuteRowResult(
+                    action_type=spec.action_type,
+                    sheet_name=row.sheet_name,
+                    row_index=row.row_index,
+                    outcome="failed",
+                    message="Playwright worker stopped early.",
+                    post_id=pid,
+                    detail=_seo_pw_job_detail(spec, url, old_v, new_v),
+                )
+                _publish_execute_row_result(execution_logger, er)
             out.append((idx, er))
     return out
 
@@ -2019,7 +2041,10 @@ async def _seo_playwright_worker_run_chunk_async(
             error_message=f"Playwright worker error: {e}",
             execution_logger=execution_logger,
         )
-    return _chunk_results_from_pw_list(chunk, spec, pw_list, execution_logger=execution_logger)
+    paused = execution_logger is not None and execution_logger.is_paused()
+    return _chunk_results_from_pw_list(
+        chunk, spec, pw_list, was_paused=paused, execution_logger=execution_logger
+    )
 
 
 async def _seo_playwright_pool_gather_async(
@@ -2174,16 +2199,16 @@ def _exec_seo_playwright_worker_pool(
             idx = j[0]
             if results[idx] is None:
                 _i, row, pid, url, new_v, old_v = j
+                # Do NOT publish — these rows were not attempted and will be retried on resume.
                 results[idx] = ExecuteRowResult(
                     action_type=spec.action_type,
                     sheet_name=row.sheet_name,
                     row_index=row.row_index,
-                    outcome="failed",
-                    message="Not run: execution paused during parallel Playwright.",
+                    outcome="skipped",
+                    message="Not attempted: execution paused before this row.",
                     post_id=pid,
                     detail=_seo_pw_job_detail(spec, url, old_v, new_v),
                 )
-                _publish_execute_row_result(execution_logger, results[idx])
 
     # REST fallback if asyncio unavailable in main thread only (workers use asyncio.run)
     return [r for r in results if r is not None]
@@ -2608,7 +2633,6 @@ def run_dry_run(
             # Pre-row pause check — responds to pause BEFORE starting the next row
             if execution_logger is not None and execution_logger.is_paused():
                 execution_logger.log_sync("dry_run_paused", "warning", f"Paused before row {i+1} of {len(rows_iter)}")
-                execution_logger.mark_complete()
                 return DryRunResponse(
                     rows_processed=len(rows_out),
                     ready_to_execute=sum(1 for r in rows_out if r.outcome == "change"),
@@ -2675,7 +2699,6 @@ def run_dry_run(
                 if execution_logger.is_paused():
                     execution_logger.log_sync("dry_run_paused", "warning",
                         f"Paused after row {i} of {len(rows_iter)}")
-                    execution_logger.mark_complete()
                     return DryRunResponse(
                         rows_processed=len(rows_out),
                         ready_to_execute=sum(1 for r in rows_out if r.outcome == "change"),
@@ -2706,7 +2729,7 @@ def run_dry_run(
             rows=rows_out,
         )
     finally:
-        if execution_logger is not None:
+        if execution_logger is not None and not execution_logger.is_paused():
             execution_logger.mark_complete()
         current_monitor_execution_id.reset(token)
 
@@ -3459,6 +3482,18 @@ def run_execute(
 
             try:
                 _shared_loop = asyncio.new_event_loop()
+                # Rebind PauseController to the shared Playwright loop now that it exists.
+                # The background thread created a PauseController on its own loop, but all
+                # Playwright coroutines run on _shared_loop, so wait_if_paused() must await
+                # on this loop — otherwise pause signals are sent to the wrong event loop.
+                if execution_logger is not None:
+                    from app.services.pause_controller import PauseController as _PauseController
+                    _shared_pause_ctrl = _PauseController(_shared_loop)
+                    execution_logger.set_pause_controller(_shared_pause_ctrl)
+                    execution_logger.set_pause_callbacks(
+                        on_pause=_shared_pause_ctrl.on_pause,
+                        on_resume=_shared_pause_ctrl.on_resume,
+                    )
                 (
                     _shared_pw_instance,
                     _shared_browser,
@@ -3557,7 +3592,8 @@ def run_execute(
                 # Pre-row pause check — responds to pause BEFORE starting the next row
                 if execution_logger is not None and execution_logger.is_paused():
                     execution_logger.log_sync("execute_paused", "warning", f"Paused before row {i+1} of {len(rows_iter)}")
-                    execution_logger.mark_complete()
+                    # Do NOT mark_complete() — that would fire the SSE "completed" event and
+                    # push the frontend to the QA step before the user clicks Resume.
                     return ExecuteResponse(
                         rows_processed=len(rows_out),
                         updated=sum(1 for r in rows_out if r.outcome == "updated"),
@@ -3634,7 +3670,10 @@ def run_execute(
                                 "warning",
                                 f"Paused during {pw_pause_label} Playwright block at row {i + 1}",
                             )
-                            execution_logger.mark_complete()
+                            # Do NOT call mark_complete() here — that would trigger the SSE
+                            # "completed" event and cause the frontend to jump to QA before
+                            # the user clicks Resume.  The execution stays alive; the finally
+                            # block in run_execute will call mark_complete() when truly done.
                             return ExecuteResponse(
                                 rows_processed=len(rows_out),
                                 updated=sum(1 for r in rows_out if r.outcome == "updated"),
@@ -3644,27 +3683,41 @@ def run_execute(
                                 paused=True,
                                 rows_completed=i,
                             )
+                        # Append only the rows that were actually processed; skipped rows
+                        # (outcome="skipped", not published) are excluded from rows_out so
+                        # the resume pass can re-process them cleanly.
+                        processed_count = 0
                         for er in pw_batch_results:
-                            rows_out.append(er)
+                            if er.outcome != "skipped":
+                                rows_out.append(er)
+                                processed_count += 1
+                            # skipped rows are deliberately not added to rows_out
+
+                        # Advance i only by the number of rows actually processed so that
+                        # resume starts at the first unprocessed row, preventing double-writes.
+                        i_after_processed = i + processed_count
+                        if execution_logger is not None:
+                            execution_logger.set_rows_completed(i_after_processed)
+
+                        if execution_logger is not None and execution_logger.is_paused():
+                            execution_logger.log_sync(
+                                "execute_paused",
+                                "warning",
+                                f"Paused after row {i_after_processed} of {len(rows_iter)}",
+                            )
+                            # Do NOT call mark_complete() — same reason as above.
+                            return ExecuteResponse(
+                                rows_processed=len(rows_out),
+                                updated=sum(1 for r in rows_out if r.outcome == "updated"),
+                                skipped=sum(1 for r in rows_out if r.outcome == "skipped"),
+                                failed=sum(1 for r in rows_out if r.outcome == "failed"),
+                                rows=rows_out,
+                                paused=True,
+                                rows_completed=i_after_processed,
+                            )
                         i = pw_next_i
                         if execution_logger is not None:
                             execution_logger.set_rows_completed(i)
-                            if execution_logger.is_paused():
-                                execution_logger.log_sync(
-                                    "execute_paused",
-                                    "warning",
-                                    f"Paused after row {i} of {len(rows_iter)}",
-                                )
-                                execution_logger.mark_complete()
-                                return ExecuteResponse(
-                                    rows_processed=len(rows_out),
-                                    updated=sum(1 for r in rows_out if r.outcome == "updated"),
-                                    skipped=sum(1 for r in rows_out if r.outcome == "skipped"),
-                                    failed=sum(1 for r in rows_out if r.outcome == "failed"),
-                                    rows=rows_out,
-                                    paused=True,
-                                    rows_completed=i,
-                                )
                         continue
 
                     if action == "on_page":
@@ -3710,7 +3763,6 @@ def run_execute(
                             "warning",
                             f"Paused after row {i} of {len(rows_iter)}",
                         )
-                        execution_logger.mark_complete()
                         return ExecuteResponse(
                             rows_processed=len(rows_out),
                             updated=sum(1 for r in rows_out if r.outcome == "updated"),
@@ -3738,7 +3790,9 @@ def run_execute(
                 rows=rows_out,
             )
         finally:
-            if execution_logger is not None:
+            # Only mark complete when the run truly finished (not when returning early due to pause).
+            # A paused run must stay alive in the registry so it can be resumed.
+            if execution_logger is not None and not execution_logger.is_paused():
                 execution_logger.mark_complete()
             # Clean up the shared Playwright session (browser, context, playwright instance).
             if _shared_loop is not None and not _shared_loop.is_closed():

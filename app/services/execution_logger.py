@@ -107,16 +107,26 @@ class ExecutionLogger:
                 _logging.getLogger(__name__).error(f"Error calling resume callback: {e}")
 
     def resume_and_reset_complete(self) -> None:
-        """Clear paused/complete flags for resume.
+        """Clear paused/complete flags for resume and unblock PauseController.
 
         _row_results are intentionally kept so the SSE stream can replay the
         full set of row results (both halves) after a page refresh/reconnect.
         The frontend's onRowResult handler deduplicates by action_type|sheet_name|row_index.
         """
+        cb = None
         with self._lock:
             self._paused = False
             self._complete = False
+            cb = self._on_resume_callback
             # Do NOT clear _row_results — SSE will replay them; frontend deduplication handles it.
+
+        # Call outside lock to avoid deadlock — mirrors resume()
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger(__name__).error(f"Error calling resume callback in resume_and_reset_complete: {e}")
 
     def set_rows_completed(self, n: int) -> None:
         with self._lock:
